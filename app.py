@@ -3,10 +3,11 @@ import datetime
 import random
 import requests
 import time
-from functools import lru_cache
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import sqlite3 # Import SQLite
+import os # For file operations
 
 # Import forecasting models with checks
 try:
@@ -44,9 +45,7 @@ st.set_page_config(layout="wide", page_title="კრიპტო სიგნა
 
 # --- Configuration ---
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
-# Increased API_CALL_INTERVAL to be safer against 429 errors
-API_CALL_INTERVAL = 2.5 # Coingecko allows 100 calls/minute, aiming for ~2.5 seconds per call to be conservative
-# Define a fixed historical data period for robust indicator calculation and model training
+API_CALL_INTERVAL = 2.5 # Increased to be safer against 429 errors
 MAX_HISTORICAL_DAYS = 365 # Fetch 1 year of data for MA99, RSI, MACD, and LSTM training
 
 COINGECKO_CRYPTO_MAP = {
@@ -55,6 +54,29 @@ COINGECKO_CRYPTO_MAP = {
     'BCH': 'bitcoin-cash', 'XRP': 'ripple', 'DOGE': 'dogecoin', 'SHIB': 'shiba-inu', 'UNI': 'uniswap',
     'AAVE': 'aave', 'SAND': 'the-sandbox', 'MANA': 'decentraland', 'AXS': 'axie-infinity', 'SKL': 'skale'
 }
+
+# --- SQLite Configuration ---
+DB_FILE = 'crypto_historical_data.db'
+
+def init_db():
+    """Initializes the SQLite database and creates the table if it doesn't exist."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS historical_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            coingecko_id TEXT NOT NULL,
+            date TEXT NOT NULL,
+            price REAL NOT NULL,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP, -- To track when data was last fetched/updated
+            UNIQUE(coingecko_id, date) -- Ensure unique entries per coin per day
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Initialize the database when the app starts
+init_db()
 
 # --- Helper Functions ---
 def rate_limit_api_call():
@@ -67,8 +89,9 @@ def rate_limit_api_call():
         time.sleep(API_CALL_INTERVAL - elapsed)
     st.session_state.last_api_call = time.time()
 
-@st.cache_data(ttl=3600) # Cache for 1 hour
+# Removed @st.cache_data here as data is now managed by SQLite
 def fetch_coin_details(coingecko_id):
+    """Fetches real-time coin details. This is not persistently cached due to real-time nature."""
     try:
         rate_limit_api_call() # Wait before making the call
         url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}"
@@ -99,26 +122,77 @@ def fetch_coin_details(coingecko_id):
         st.error(f"Error fetching coin details for {coingecko_id}: {e}")
         return None
 
-@st.cache_data(ttl=3600) # Cache for 1 hour
-def fetch_historical_data_coingecko(coingecko_id, days=MAX_HISTORICAL_DAYS): # Always fetch MAX_HISTORICAL_DAYS
+# Modified function to use SQLite for historical data
+def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Calculate the earliest date we need based on 'days'
+    earliest_date_needed = (datetime.date.today() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
+
+    # 1. Try to load from SQLite first
+    cursor.execute(f"SELECT date, price FROM historical_prices WHERE coingecko_id = ? AND date >= ? ORDER BY date ASC",
+                   (coingecko_id, earliest_date_needed))
+    
+    db_data = cursor.fetchall()
+    historical_data = []
+
+    if db_data:
+        # Check if we have enough data and if the latest date is today (or very recent)
+        latest_date_in_db = max([row[0] for row in db_data])
+        if len(db_data) >= days and latest_date_in_db == datetime.date.today().strftime('%Y-%m-%d'):
+            st.toast(f"ისტორიული მონაცემები ჩაიტვირთა SQLite ქეშიდან: {coingecko_id}", icon="💾")
+            historical_data = [{'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'), 'price': row[1], 'type': 'historical'} for row in db_data]
+            conn.close()
+            return historical_data
+        else:
+            st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. განახლება API-დან: {coingecko_id}")
+
+    # 2. If not in DB or outdated, fetch from API
+    st.toast(f"მიმდინარეობს ისტორიული მონაცემების ჩატვირთვა API-დან: {coingecko_id}", icon="🌐")
     try:
         rate_limit_api_call() # Wait before making the call
         url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/market_chart"
         params = {'vs_currency': 'usd', 'days': str(days), 'interval': 'daily'}
         response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
-        return [{'date': datetime.datetime.fromtimestamp(p[0] / 1000), 'price': round(p[1], 8), 'type': 'historical'} for p in data.get('prices', [])]
+        response.raise_for_status()
+        api_data = response.json()
+        
+        fetched_historical_data = []
+        for p in api_data.get('prices', []):
+            date_obj = datetime.datetime.fromtimestamp(p[0] / 1000)
+            fetched_historical_data.append({
+                'date': date_obj, 
+                'price': round(p[1], 8), 
+                'type': 'historical'
+            })
+        
+        # 3. Save/Update to SQLite
+        for entry in fetched_historical_data:
+            cursor.execute('''
+                INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price)
+                VALUES (?, ?, ?)
+            ''', (coingecko_id, entry['date'].strftime('%Y-%m-%d'), entry['price']))
+        
+        conn.commit()
+        st.toast(f"ისტორიული მონაცემები შენახულია/განახლებულია SQLite-ში: {coingecko_id}", icon="💾")
+        
+        conn.close()
+        return fetched_historical_data
+
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:
             st.error(f"Error: Coingecko API ლიმიტი გადაჭარბებულია ისტორიული მონაცემებისთვის. გთხოვთ, სცადოთ მოგვიანებით. ({e})")
         else:
             st.error(f"Error fetching historical data for {coingecko_id}: {e}")
+        conn.close()
         return []
     except requests.exceptions.RequestException as e:
         st.error(f"Error fetching historical data for {coingecko_id}: {e}")
+        conn.close()
         return []
 
+# --- CryptoDataForecaster and other functions remain the same ---
 class CryptoDataForecaster:
     def __init__(self, symbol, historical_prices_df):
         self.symbol = symbol.upper()
@@ -128,7 +202,6 @@ class CryptoDataForecaster:
         self.historical_prices['price'] = self.historical_prices['price'].astype(float)
         
         # Pre-calculate technical indicators for the full historical data
-        # This will be used as features for LSTM and for display
         self.historical_with_indicators = self.calculate_technical_indicators()
 
     def _generate_lstm_predictions(self, days):
@@ -136,55 +209,43 @@ class CryptoDataForecaster:
             st.error("LSTM მოდელი არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ TensorFlow/Keras, NumPy და Scikit-learn.")
             return [] # Return empty if dependencies are missing
 
-        # Use historical data with calculated indicators as features
-        df_lstm = self.historical_with_indicators[['price', 'MA7', 'MA25', 'RSI', 'MACD']].dropna() # Drop rows with NaNs (e.g., at the beginning due to MA/RSI calculation)
+        df_lstm = self.historical_with_indicators[['price', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
         
-        # Ensure enough data remains after dropping NaNs
-        if len(df_lstm) < 100: # Increased minimum data requirement for LSTM to be effective
+        if len(df_lstm) < 100:
             st.warning(f"არასაკმარისი სუფთა მონაცემები (MA, RSI, MACD-ით) LSTM პროგნოზისთვის (მინიმუმ 100 დღე).")
             return []
 
-        # Define look_back and number of features
-        look_back = 60 # Number of previous days to consider for prediction
-        n_features = df_lstm.shape[1] # Number of features (price + indicators)
+        look_back = 60
+        n_features = df_lstm.shape[1]
 
         data_scaled = MinMaxScaler(feature_range=(0, 1)).fit_transform(df_lstm.values)
         scaler_price = MinMaxScaler(feature_range=(0, 1))
-        # Fit scaler specifically to the price column for inverse transformation
         scaler_price.fit(df_lstm['price'].values.reshape(-1, 1)) 
 
         X, y = [], []
         for i in range(len(data_scaled) - look_back):
-            X.append(data_scaled[i:(i + look_back), :]) # All features for X
-            y.append(data_scaled[i + look_back, 0])      # Only price for y (target)
+            X.append(data_scaled[i:(i + look_back), :])
+            y.append(data_scaled[i + look_back, 0])
         X = np.array(X)
         y = np.array(y)
 
-        # Build LSTM model
         model = Sequential()
-        model.add(LSTM(units=100, return_sequences=True, input_shape=(look_back, n_features))) # Increased units
-        model.add(Dropout(0.3)) # Increased dropout
-        model.add(LSTM(units=100, return_sequences=False)) # Increased units
+        model.add(LSTM(units=100, return_sequences=True, input_shape=(look_back, n_features)))
+        model.add(Dropout(0.3))
+        model.add(LSTM(units=100, return_sequences=False))
         model.add(Dropout(0.3))
         model.add(Dense(units=1)) 
         model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
 
-        # Train model
         try:
-            # epochs=50 for better learning, batch_size=32 for faster training than 1
             model.fit(X, y, epochs=50, batch_size=32, verbose=0) 
         except Exception as e:
             st.error(f"შეცდომა LSTM მოდელის ტრენინგისას: {e}. პროგნოზი მიუწვდომელია.")
             return []
 
-        # Make predictions for the next 'days'
         prediction_list = []
-        # Start prediction from the last 'look_back' data points with all features
         current_input = data_scaled[-look_back:].reshape(1, look_back, n_features)
-        
-        # Get the last valid date from the *original* historical data (before dropping NaNs for indicators)
         last_date_original = self.historical_prices.index[-1]
-
 
         for i in range(days):
             predicted_scaled_price = model.predict(current_input, verbose=0)[0, 0]
@@ -193,18 +254,13 @@ class CryptoDataForecaster:
             date = last_date_original + datetime.timedelta(days=i+1)
             prediction_list.append({'date': date, 'price': max(0.00000001, round(predicted_price, 8)), 'type': 'prediction'})
             
-            # This is a simplification for a single-output LSTM where only price is directly predicted.
-            # For multi-output LSTM (predicting price + indicators), the approach would differ.
-            
-            # Simple update: replace the oldest value in the look_back window with the new prediction
-            # and maintain a placeholder for other features (using the last observed scaled values)
-            last_features_scaled = current_input[0, -1, :].copy() # Get the last set of scaled features
-            last_features_scaled[0] = predicted_scaled_price # Replace only the price
+            last_features_scaled = current_input[0, -1, :].copy()
+            last_features_scaled[0] = predicted_scaled_price
             current_input = np.append(current_input[:, 1:, :], last_features_scaled.reshape(1, 1, n_features), axis=1)
 
         return prediction_list
 
-    def generate_predictions(self, days=30, model_choice="ARIMA Model"): # Default to ARIMA for statistical rigor
+    def generate_predictions(self, days=30, model_choice="ARIMA Model"):
         if self.historical_prices.empty:
             st.warning("ისტორიული მონაცემები არ არის პროგნოზირებისთვის.")
             return []
@@ -221,7 +277,6 @@ class CryptoDataForecaster:
 
             series = self.historical_prices['price']
             try:
-                # Use a robust (5,1,0) order - can be optimized further with auto_arima
                 model = ARIMA(series, order=(5,1,0)) 
                 model_fit = model.fit()
                 forecast_result = model_fit.predict(start=len(series), end=len(series) + days - 1)
@@ -246,7 +301,6 @@ class CryptoDataForecaster:
             df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
 
             try:
-                # Increased changepoint_prior_scale for more flexibility with volatile crypto data
                 model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, changepoint_prior_scale=0.1) 
                 model.fit(df_prophet)
                 future = model.make_future_dataframe(periods=days)
@@ -268,8 +322,7 @@ class CryptoDataForecaster:
         return prediction_data
 
     def generate_signals_from_prediction(self, prediction_data):
-        # Signals will be generated based on the predicted prices
-        if len(prediction_data) < 7: # Need at least 7 days for 7-day MA for signals
+        if len(prediction_data) < 7:
             return []
         
         df_prediction = pd.DataFrame(prediction_data)
@@ -277,8 +330,6 @@ class CryptoDataForecaster:
         df_prediction.set_index('date', inplace=True)
         df_prediction['price'] = df_prediction['price'].astype(float)
 
-        # Calculate Moving Averages on predicted data for signal generation
-        # These are short-term MAs used specifically for signal crossovers
         short_window = 3 
         long_window = 7 
 
@@ -286,7 +337,6 @@ class CryptoDataForecaster:
         df_prediction['MA_long'] = df_prediction['price'].rolling(window=long_window).mean()
 
         signals = []
-        # Look for moving average crossovers
         for i in range(1, len(df_prediction)):
             current_date = df_prediction.index[i]
             if pd.isna(df_prediction['MA_short'].iloc[i]) or pd.isna(df_prediction['MA_long'].iloc[i]):
@@ -315,16 +365,12 @@ class CryptoDataForecaster:
         return sorted(signals, key=lambda x: x['date'])
 
     def calculate_technical_indicators(self):
-        # Always calculate indicators on the full historical dataset for accuracy
         df_hist = self.historical_prices.copy()
         
-        # Moving Averages (MA) - calculated on historical data
         df_hist['MA7'] = df_hist['price'].rolling(window=7, min_periods=1).mean()
         df_hist['MA25'] = df_hist['price'].rolling(window=25, min_periods=1).mean()
         df_hist['MA99'] = df_hist['price'].rolling(window=99, min_periods=1).mean()
 
-        # RSI Calculation (Standard: 14 periods)
-        # Using EWMA for RSI for smoother calculation
         delta = df_hist['price'].diff()
         gain = (delta.where(delta > 0, 0))
         loss = (-delta.where(delta < 0, 0))
@@ -332,12 +378,11 @@ class CryptoDataForecaster:
         avg_gain = gain.ewm(span=14, adjust=False, min_periods=14).mean()
         avg_loss = loss.ewm(span=14, adjust=False, min_periods=14).mean()
         
-        rs = avg_gain / avg_loss.replace(0, np.nan) # Handle division by zero
+        rs = avg_gain / avg_loss.replace(0, np.nan)
         df_hist['RSI'] = 100 - (100 / (1 + rs))
-        df_hist['RSI'].fillna(0, inplace=True) # Fill initial NaNs with 0 (or a more suitable value)
-        df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0) # Handle inf values
+        df_hist['RSI'].fillna(0, inplace=True)
+        df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-        # MACD Calculation (Standard: EMA 12, EMA 26, Signal EMA 9)
         exp1 = df_hist['price'].ewm(span=12, adjust=False, min_periods=12).mean()
         exp2 = df_hist['price'].ewm(span=26, adjust=False, min_periods=26).mean()
         df_hist['MACD'] = exp1 - exp2
@@ -560,7 +605,7 @@ with col1: # Left Pane
 
             if submit_button:
                 st.session_state.current_symbol = symbol_input
-                st.toast(f"Fetching data for {st.session_state.current_symbol}...")
+                st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
                 st.rerun()
 
         st.markdown("<span>პოპულარული:</span>", unsafe_allow_html=True)
@@ -570,7 +615,7 @@ with col1: # Left Pane
             with cols_pop[i]:
                 if st.button(crypto_tag, key=f"tag_{crypto_tag}", use_container_width=True):
                     st.session_state.current_symbol = crypto_tag
-                    st.toast(f"Fetching data for {st.session_state.current_symbol}...")
+                    st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
                     st.rerun()
 
     st.markdown("---") # Separator
@@ -630,10 +675,9 @@ with col2: # Center Pane (Chart Section)
             with filter_cols[i]:
                 if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True, type="secondary" if st.session_state.current_period != period else "primary"):
                     st.session_state.current_period = period
-                    st.toast(f"Showing {period} days data for {st.session_state.current_symbol}...")
+                    st.toast(f"Showing {period} days data for {st.session_state.current_symbol}...", icon="📊")
         
         # Model Selection
-        # Removed "Simulated Trend" as it's not a statistical forecasting model
         model_options = ["ARIMA Model", "Prophet Model"]
         if LSTM_AVAILABLE:
             model_options.append("LSTM Model")
@@ -649,7 +693,8 @@ with col2: # Center Pane (Chart Section)
 
         # Chart
         if coingecko_id and coin_details:
-            historical_data_list_full = fetch_historical_data_coingecko(coingecko_id, days=MAX_HISTORICAL_DAYS)
+            # Use the new SQLite fetching function here
+            historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
             
             if historical_data_list_full:
                 df_historical_full = pd.DataFrame(historical_data_list_full)
@@ -672,7 +717,6 @@ with col2: # Center Pane (Chart Section)
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
                 # Filter historical data for display based on current_period AFTER indicator calculation
-                # Use forecaster.historical_with_indicators as it contains all calculated MAs, RSI, MACD
                 df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.current_period).copy()
                 
                 # --- Create Plotly Subplots ---
@@ -731,8 +775,6 @@ with col2: # Center Pane (Chart Section)
                 # Add Signals as Scatter points with text labels on Row 1
                 for signal in signals:
                     signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
-                    # Only show signals if they fall within the current display period or prediction period
-                    # Ensure signal date is within the plotted range
                     if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
                         fig.add_trace(go.Scatter(
                             x=[signal['date']],
@@ -859,8 +901,10 @@ with col3: # Right Pane (Signals Section)
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
         
         if coingecko_id and coin_details:
-            df_historical_full = pd.DataFrame(historical_data_list_full) # Use the already fetched full historical data
-            forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical_full)
+            # Use the new SQLite fetching function here as well
+            historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
+            
+            forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list_full))
             
             with st.spinner(f"გენერირდება სიგნალები {st.session_state.prediction_model} მოდელიდან..."):
                 prediction_data_list = forecaster.generate_predictions(days=30, model_choice=st.session_state.prediction_model)
