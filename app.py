@@ -136,23 +136,31 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    earliest_date_needed = (datetime.date.today() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
+    # Define a buffer for "freshness" - data from today or yesterday is typically fine
+    today_date = datetime.date.today()
+    yesterday_date = today_date - datetime.timedelta(days=1)
 
-    cursor.execute(f"SELECT date, price FROM historical_prices WHERE coingecko_id = ? AND date >= ? ORDER BY date ASC",
-                   (coingecko_id, earliest_date_needed))
+    # Try to fetch existing data from DB
+    cursor.execute(f"SELECT date, price FROM historical_prices WHERE coingecko_id = ? ORDER BY date ASC",
+                   (coingecko_id,))
     
     db_data = cursor.fetchall()
-    historical_data = []
-
+    
+    # Convert DB data to DataFrame for easier manipulation
     if db_data:
-        latest_date_in_db = max([row[0] for row in db_data])
-        # Check if the latest date in DB is today and we have enough historical points
-        # Using today's date for exact match for simple cache validation
-        if datetime.datetime.strptime(latest_date_in_db, '%Y-%m-%d').date() == datetime.date.today() and len(db_data) >= days:
+        df_db = pd.DataFrame(db_data, columns=['date', 'price'])
+        df_db['date'] = pd.to_datetime(df_db['date'])
+        
+        latest_date_in_db = df_db['date'].max().date()
+        
+        # Check if the cached data is sufficiently fresh and reasonably long enough
+        # We consider it fresh if the latest date in DB is today or yesterday.
+        # We consider it long enough if it has at least 90% of MAX_HISTORICAL_DAYS.
+        if (latest_date_in_db >= yesterday_date) and (len(df_db) >= MAX_HISTORICAL_DAYS * 0.9): 
             st.toast(f"ისტორიული მონაცემები ჩაიტვირთა SQLite ქეშიდან: {coingecko_id}", icon="💾")
-            historical_data = [{'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'), 'price': row[1], 'type': 'historical'} for row in db_data]
             conn.close()
-            return historical_data
+            # Filter DB data to the requested 'days' before returning
+            return df_db.tail(days).to_dict(orient='records')
         else:
             st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. ვცდილობ განახლებას API-დან: {coingecko_id}")
 
@@ -160,39 +168,43 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
     try:
         rate_limit_api_call()
         url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/market_chart"
-        # Coingecko 'days' parameter: 1 for 24 hours, 7 for 7 days, etc. Max is 'max'.
-        # For MAX_HISTORICAL_DAYS, we want 'max' if available, otherwise use specified days.
-        # Coingecko returns daily prices for days > 90.
+        # Fetch 'max' and trim later to MAX_HISTORICAL_DAYS for DB storage
         params = {'vs_currency': 'usd', 'days': 'max', 'interval': 'daily'} 
         response = requests.get(url, params=params, timeout=20)
         response.raise_for_status()
         api_data = response.json()
         
-        fetched_historical_data = []
+        fetched_data = []
         for p in api_data.get('prices', []):
             date_obj = datetime.datetime.fromtimestamp(p[0] / 1000)
-            fetched_historical_data.append({
-                'date': date_obj, 
-                'price': round(p[1], 8), 
-                'type': 'historical'
+            fetched_data.append({
+                'date': date_obj.strftime('%Y-%m-%d'), # Store as string in DB
+                'price': round(p[1], 8),
             })
         
-        # Filter to MAX_HISTORICAL_DAYS if 'max' returned too much or if we just want a subset
-        if len(fetched_historical_data) > days:
-            fetched_historical_data = fetched_historical_data[-days:]
+        df_fetched = pd.DataFrame(fetched_data)
+        df_fetched['date'] = pd.to_datetime(df_fetched['date'])
+        
+        # Ensure we only keep MAX_HISTORICAL_DAYS for DB storage
+        if len(df_fetched) > MAX_HISTORICAL_DAYS:
+            df_fetched = df_fetched.tail(MAX_HISTORICAL_DAYS)
 
-        # Insert/update fetched data into DB
-        for entry in fetched_historical_data:
+        # Clear existing data for this coin to avoid duplicates and simplify updates
+        cursor.execute("DELETE FROM historical_prices WHERE coingecko_id = ?", (coingecko_id,))
+        
+        # Insert fetched data into DB
+        for _, row in df_fetched.iterrows():
             cursor.execute('''
-                INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price)
+                INSERT INTO historical_prices (coingecko_id, date, price)
                 VALUES (?, ?, ?)
-            ''', (coingecko_id, entry['date'].strftime('%Y-%m-%d'), entry['price']))
+            ''', (coingecko_id, row['date'].strftime('%Y-%m-%d'), row['price']))
         
         conn.commit()
         st.toast(f"ისტორიული მონაცემები შენახულია/განახლებულია SQLite-ში: {coingecko_id}", icon="💾")
         
         conn.close()
-        return fetched_historical_data
+        # Return only the requested 'days' from the freshly fetched/stored data
+        return df_fetched.tail(days).to_dict(orient='records')
 
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:
@@ -811,6 +823,7 @@ with col2:
                 st.rerun()
 
         if coingecko_id and coin_details:
+            # Note: fetch_historical_data_sqlite now handles internal filtering to 'days'
             historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
             
             if historical_data_list_full:
@@ -832,6 +845,7 @@ with col2:
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
                 # Filter historical features for display based on selected period
+                # Note: `tail(st.session_state.current_period)` now happens here for display
                 df_indicators_display = forecaster.historical_with_features.tail(st.session_state.current_period).copy()
                 
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
@@ -1027,6 +1041,7 @@ with col3:
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
         
         if coingecko_id and coin_details:
+            # Note: fetch_historical_data_sqlite now handles internal filtering to 'days'
             historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
             
             forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list_full))
