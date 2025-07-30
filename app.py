@@ -669,7 +669,7 @@ with col1: # Left Pane
                 st.rerun()
 
         st.markdown("<span>პოპულარული:</span>", unsafe_allow_html=True)
-        popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'SKL', SAND]
+        popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'SKL', 'SAND']
         cols_pop = st.columns(len(popular_cryptos))
         for i, crypto_tag in enumerate(popular_cryptos):
             with cols_pop[i]:
