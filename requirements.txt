@@ -1,10 +1,11 @@
 streamlit
-requests
 pandas
 plotly
+requests
+numpy
+scipy
+scikit-learn
 statsmodels
 prophet
-numpy
-scikit-learn
 tensorflow
 pmdarima
