@@ -6,8 +6,10 @@ import time
 from functools import lru_cache
 import pandas as pd
 import plotly.graph_objects as go
-from statsmodels.tsa.arima.model import ARIMA # <--- ეს იმპორტი დაგჭირდება თუ ARIMA-ს გამოიყენებ
-# from prophet import Prophet # <--- ეს იმპორტი დაგჭირდება თუ Prophet-ს გამოიყენებ
+
+# Import forecasting models
+from statsmodels.tsa.arima.model import ARIMA
+from prophet import Prophet # Ensure you have prophet installed: pip install prophet
 
 # --- Set page config for wide mode ---
 st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
@@ -27,7 +29,7 @@ COINGECKO_CRYPTO_MAP = {
 def rate_limit_api_call():
     if 'last_api_call' not in st.session_state:
         st.session_state.last_api_call = 0
-
+    
     elapsed = time.time() - st.session_state.last_api_call
     if elapsed < API_CALL_INTERVAL:
         time.sleep(API_CALL_INTERVAL - elapsed)
@@ -73,71 +75,121 @@ def fetch_historical_data_coingecko(coingecko_id, days=90):
         st.error(f"Error fetching historical data for {coingecko_id}: {e}")
         return []
 
-class CryptoDataForecaster: # Renamed from Simulator
+class CryptoDataForecaster:
     def __init__(self, symbol, historical_prices_df):
         self.symbol = symbol.upper()
         self.historical_prices = historical_prices_df # DataFrame with 'date' and 'price'
 
-    def generate_predictions(self, days=30):
-        if self.historical_prices.empty:
-            return []
-
-        # Convert date to datetime if not already
-        self.historical_prices['date'] = pd.to_datetime(self.historical_prices['date'])
-        self.historical_prices.set_index('date', inplace=True)
-
-        # --- Simplified Forecasting (Conceptual, for demonstration) ---
-        # For a real application, you'd use a robust model like ARIMA, Prophet, or an LSTM.
-        # This is a basic moving average extrapolation, which is more stable than random walk.
-
-        # Ensure prices are float
-        self.historical_prices['price'] = self.historical_prices['price'].astype(float)
-
-        if len(self.historical_prices) < 5: # Need at least some data for a moving average
-            last_price = self.historical_prices['price'].iloc[-1] if not self.historical_prices.empty else 0
-            return [{'date': self.historical_prices.index[-1] + datetime.timedelta(days=i), 
-                     'price': last_price * (1 + random.uniform(-0.001, 0.001)), 'type': 'prediction'} 
-                    for i in range(1, days + 1)]
-
-        # Calculate a short-term moving average and a long-term moving average
-        short_ma = self.historical_prices['price'].rolling(window=5).mean()
-        long_ma = self.historical_prices['price'].rolling(window=20).mean()
-
-        last_short_ma = short_ma.iloc[-1]
-        last_long_ma = long_ma.iloc[-1]
-        last_price = self.historical_prices['price'].iloc[-1]
-        last_date = self.historical_prices.index[-1]
-
+    def _generate_simple_predictions(self, days):
+        # This is the fallback/simplified forecasting method
+        last_price = self.historical_prices['price'].iloc[-1] if not self.historical_prices.empty else 0
+        last_date = self.historical_prices.index[-1] if not self.historical_prices.empty else datetime.date.today()
+        
         prediction_data = []
-        current_predicted_price = last_price
+        current_price = last_price
+        trend_strength = random.uniform(-0.001, 0.001) # Much smaller random trend
+        volatility = random.uniform(0.005, 0.015) # Much smaller volatility
 
-        # Simple trend based on MA crossover and a dampened random walk
         for i in range(1, days + 1):
             date = last_date + datetime.timedelta(days=i)
+            random_change = (random.random() - 0.5) * volatility 
+            current_price *= (1 + trend_strength + random_change)
+            current_price = max(0.00000001, current_price)
+            prediction_data.append({'date': date, 'price': round(current_price, 8), 'type': 'prediction'})
+        return prediction_data
 
-            # Simple trend adjustment based on recent MA
-            if last_short_ma > last_long_ma: # Upward trend
-                trend_factor = random.uniform(1.001, 1.005) # Small positive drift
-            else: # Downward or sideways trend
-                trend_factor = random.uniform(0.995, 0.999) # Small negative drift
+    def generate_predictions(self, days=30, model_choice="Moving Average (Simplified)"):
+        if self.historical_prices.empty:
+            st.warning("ისტორიული მონაცემები არ არის პროგნოზირებისთვის.")
+            return []
 
-            # Add a smaller, more controlled random fluctuation
-            random_fluctuation = random.uniform(0.995, 1.005) 
+        # Convert date to datetime and set as index
+        df = self.historical_prices.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df['price'] = df['price'].astype(float)
 
-            current_predicted_price *= trend_factor * random_fluctuation
-            current_predicted_price = max(0.00000001, current_predicted_price) # Ensure price doesn't go negative
+        prediction_data = []
+        last_date = df.index[-1]
+        
+        if model_choice == "Moving Average (Simplified)":
+            # Your existing simplified MA based forecasting logic
+            if len(df) < 5:
+                return self._generate_simple_predictions(days) # Fallback if not enough data for MA trend
 
-            prediction_data.append({'date': date, 'price': round(current_predicted_price, 8), 'type': 'prediction'})
+            short_ma = df['price'].rolling(window=5).mean()
+            long_ma = df['price'].rolling(window=20).mean()
 
-            # Update last_short_ma, last_long_ma conceptually for next step (in a real model, this would be part of the forecast)
-            # For this simple example, we're just carrying forward the last trend, a more complex model would recalculate.
+            last_short_ma = short_ma.iloc[-1]
+            last_long_ma = long_ma.iloc[-1]
+            current_predicted_price = df['price'].iloc[-1]
 
+            for i in range(1, days + 1):
+                date = last_date + datetime.timedelta(days=i)
+                if last_short_ma > last_long_ma:
+                    trend_factor = random.uniform(1.001, 1.005)
+                else:
+                    trend_factor = random.uniform(0.995, 0.999)
+                random_fluctuation = random.uniform(0.995, 1.005) 
+                current_predicted_price *= trend_factor * random_fluctuation
+                current_predicted_price = max(0.00000001, current_predicted_price)
+                prediction_data.append({'date': date, 'price': round(current_predicted_price, 8), 'type': 'prediction'})
+            
+        elif model_choice == "ARIMA Model":
+            if len(df) < 30: # ARIMA needs more data
+                st.warning("არასაკმარისი მონაცემები ARIMA პროგნოზისთვის (მინიმუმ 30 დღე). გამოიყენება გამარტივებული პროგნოზი.")
+                return self._generate_simple_predictions(days)
+
+            series = df['price']
+            try:
+                # ARIMA order (p,d,q) can be tuned. (5,1,0) is a common starting point.
+                # d=1 means first-order differencing (to make series stationary)
+                model = ARIMA(series, order=(5,1,0)) 
+                model_fit = model.fit()
+                
+                # Make predictions
+                # start and end define the range of the forecast relative to the original series length
+                forecast_result = model_fit.predict(start=len(series), end=len(series) + days - 1)
+                
+                for i, price in enumerate(forecast_result):
+                    date = last_date + datetime.timedelta(days=i+1)
+                    prediction_data.append({'date': date, 'price': max(0.00000001, round(price, 8)), 'type': 'prediction'})
+            except Exception as e:
+                st.error(f"შეცდომა ARIMA მოდელის გაშვებისას: {e}. გამოიყენება გამარტივებული პროგნოზი.")
+                return self._generate_simple_predictions(days)
+
+        elif model_choice == "Prophet Model":
+            if len(df) < 30: # Prophet also prefers more data
+                st.warning("არასაკმარისი მონაცემები Prophet პროგნოზისთვის (მინიმუმ 30 დღე). გამოიყენება გამარტივებული პროგნოზი.")
+                return self._generate_simple_predictions(days)
+
+            df_prophet = df.reset_index()[['date', 'price']].rename(columns={'date': 'ds', 'price': 'y'})
+            df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
+
+            try:
+                # You can customize Prophet's parameters (e.g., seasonality_mode='multiplicative')
+                model = Prophet(daily_seasonality=True) 
+                model.fit(df_prophet)
+                
+                future = model.make_future_dataframe(periods=days)
+                forecast = model.predict(future)
+                
+                for _, row in forecast.tail(days).iterrows():
+                    prediction_data.append({
+                        'date': row['ds'], 
+                        'price': max(0.00000001, round(row['yhat'], 8)), # yhat is the prediction
+                        'type': 'prediction'
+                    })
+            except Exception as e:
+                st.error(f"შეცდომა Prophet მოდელის გაშვებისას: {e}. გამოიყენება გამარტივებული პროგნოზი.")
+                return self._generate_simple_predictions(days)
+        
         return prediction_data
 
     def generate_signals_from_prediction(self, prediction_data):
-        if len(prediction_data) < 5: # Need more data for MA-based signals
+        if len(prediction_data) < 7: # Need at least 7 days for 7-day MA
             return []
-
+        
         df_prediction = pd.DataFrame(prediction_data)
         df_prediction['date'] = pd.to_datetime(df_prediction['date'])
         df_prediction.set_index('date', inplace=True)
@@ -154,7 +206,9 @@ class CryptoDataForecaster: # Renamed from Simulator
         # Look for moving average crossovers
         for i in range(1, len(df_prediction)):
             current_date = df_prediction.index[i]
-            prev_date = df_prediction.index[i-1]
+            # Ensure we have enough data points for MAs
+            if pd.isna(df_prediction['MA_short'].iloc[i]) or pd.isna(df_prediction['MA_long'].iloc[i]):
+                continue # Skip if MAs are not yet calculated
 
             if (df_prediction['MA_short'].iloc[i-1] < df_prediction['MA_long'].iloc[i-1] and
                 df_prediction['MA_short'].iloc[i] > df_prediction['MA_long'].iloc[i]):
@@ -177,7 +231,7 @@ class CryptoDataForecaster: # Renamed from Simulator
                     'confidence': f"{random.randint(65, 85)}%",
                     'argumentation': f"AI პროგნოზირებს მოკლევადიანი მოძრავი საშუალოს (MA{short_window}) გრძელვადიან მოძრავ საშუალოზე (MA{long_window}) ქვემოთ კვეთას, რაც პოტენციური დაღმავალი ტრენდის დასაწყისს მიანიშნებს."
                 })
-
+        
         return sorted(signals, key=lambda x: x['date'])
 
 
@@ -196,7 +250,7 @@ def format_currency(value):
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-
+    
     :root {
         --bg-dark: #0a0a0a;
         --bg-medium: #1a1a1a;
@@ -211,7 +265,7 @@ st.markdown("""
         --card-bg: #1c1c1c;
         --border-color: #333;
     }
-
+    
     /* Apply font and background to the Streamlit app */
     .stApp {
         font-family: 'Inter', sans-serif;
@@ -219,16 +273,16 @@ st.markdown("""
         color: var(--text-light);
         padding: 1rem; /* Adjust padding if needed */
     }
-
+    
     h1 {
         font-size: 2.5rem;
         font-weight: 800;
         text-shadow: 0 0 10px var(--accent-blue), 0 0 20px var(--accent-purple);
         color: var(--text-light); /* Ensure H1 color */
     }
-
+    
     .live-text { color: var(--accent-red); /* No animation support here */ }
-
+    
     .stSelectbox, .stTextInput, .stButton > button {
         background-color: var(--bg-dark);
         color: var(--text-light);
@@ -346,7 +400,7 @@ st.markdown("""
     .status-indicator.connected i {
         color: var(--accent-green);
     }
-
+    
     /* Minor adjustments for responsiveness in Streamlit context */
     @media (max-width: 768px) {
         .stApp { padding: 0.5rem; }
@@ -375,6 +429,8 @@ if 'current_symbol' not in st.session_state:
     st.session_state.current_symbol = 'SAND'
 if 'current_period' not in st.session_state:
     st.session_state.current_period = 90
+if 'prediction_model' not in st.session_state:
+    st.session_state.prediction_model = "Moving Average (Simplified)" # Default model
 
 # Create columns for the main layout (Streamlit's way of layout)
 col1, col2, col3 = st.columns([0.8, 1.5, 0.8]) # Adjust ratios as needed
@@ -382,7 +438,7 @@ col1, col2, col3 = st.columns([0.8, 1.5, 0.8]) # Adjust ratios as needed
 with col1: # Left Pane
     with st.container(border=False): # Use container to mimic card styling
         st.markdown("<h3>აირჩიეთ კრიპტოვალუტა:</h3>", unsafe_allow_html=True)
-
+        
         # Use a form to group input and button to prevent immediate rerun on text change
         with st.form("symbol_form"):
             symbol_input = st.text_input("შეიყვანეთ სიმბოლო (მაგ. BTC, ETH)", st.session_state.current_symbol).upper().strip()
@@ -410,14 +466,14 @@ with col1: # Left Pane
 
         # Fetch data on initial load or symbol change
         coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
-
+        
         if coingecko_id:
             with st.spinner(f"იტვირთება მონაცემები {st.session_state.current_symbol}-ისთვის..."):
                 coin_details = fetch_coin_details(coingecko_id)
                 if coin_details:
                     st.markdown(f"<h2 id='coin-name'>{coin_details['name']} ({coin_details['symbol']})</h2>", unsafe_allow_html=True)
                     st.markdown(f"<p id='current-price' class='price-value'>{format_price(coin_details['currentPrice'])} $</p>", unsafe_allow_html=True)
-
+                    
                     # Market Stats Grid using Streamlit columns
                     col_m1, col_m2 = st.columns(2)
                     with col_m1:
@@ -427,7 +483,7 @@ with col1: # Left Pane
                     with col_m2:
                         st.markdown("<div class='stat-card'><h4>24სთ მოცულობა</h4>", unsafe_allow_html=True)
                         st.markdown(f"<div class='value'>{format_currency(coin_details['24hVolume'])}</div></div>", unsafe_allow_html=True)
-
+                    
                     col_m3, col_m4 = st.columns(2)
                     with col_m3:
                         st.markdown("<div class='stat-card'><h4>კაპიტალიზაცია</h4>", unsafe_allow_html=True)
@@ -452,9 +508,8 @@ with col1: # Left Pane
 with col2: # Center Pane (Chart Section)
     with st.container(border=False): # Use container to mimic card styling
         st.markdown(f"<div class='chart-header'><h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3></div>", unsafe_allow_html=True)
-
-        # Time Filters
-        st.markdown("<div class='chart-controls'>", unsafe_allow_html=True)
+        
+        # Time Filters and Model Selection
         filter_cols = st.columns(3)
         periods = [90, 30, 7]
         for i, period in enumerate(periods):
@@ -463,22 +518,32 @@ with col2: # Center Pane (Chart Section)
                     st.session_state.current_period = period
                     st.toast(f"Fetching data for {st.session_state.current_symbol} for {period} days...")
                     st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Model Selection
+        model_options = ["Moving Average (Simplified)", "ARIMA Model", "Prophet Model"]
+        selected_model = st.selectbox(
+            "აირჩიეთ პროგნოზირების მოდელი:",
+            model_options,
+            index=model_options.index(st.session_state.prediction_model)
+        )
+        if selected_model != st.session_state.prediction_model:
+            st.session_state.prediction_model = selected_model
+            st.rerun()
 
         # Chart
         if coingecko_id and coin_details:
             historical_data_list = fetch_historical_data_coingecko(coingecko_id, days=st.session_state.current_period)
             if historical_data_list:
                 df_historical = pd.DataFrame(historical_data_list)
-
-                # Generate predictions using the new forecaster
+                
+                # Generate predictions using the new forecaster and selected model
                 forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
-                prediction_data_list = forecaster.generate_predictions()
+                prediction_data_list = forecaster.generate_predictions(model_choice=st.session_state.prediction_model)
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
                 # Prepare data for Plotly
                 df_prediction = pd.DataFrame(prediction_data_list)
-
+                
                 # Convert 'date' columns to datetime objects
                 df_historical['date'] = pd.to_datetime(df_historical['date'])
                 df_prediction['date'] = pd.to_datetime(df_prediction['date'])
@@ -560,7 +625,7 @@ with col2: # Center Pane (Chart Section)
                 )
 
                 st.plotly_chart(fig, use_container_width=True)
-
+                
                 st.markdown("""
                 <div class="chart-legend">
                     <div class="legend-item"><div class="legend-color historical"></div><span>ისტორია</span></div>
@@ -578,13 +643,15 @@ with col2: # Center Pane (Chart Section)
 with col3: # Right Pane (Signals Section)
     with st.container(border=False): # Use container to mimic card styling
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
-
+        
         if coingecko_id and coin_details and historical_data_list:
             df_historical = pd.DataFrame(historical_data_list) # Re-create DataFrame for consistency
             forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
-            prediction_data_list = forecaster.generate_predictions()
+            
+            # Pass the selected model to generate_predictions
+            prediction_data_list = forecaster.generate_predictions(model_choice=st.session_state.prediction_model)
             signals = forecaster.generate_signals_from_prediction(prediction_data_list)
-
+            
             if signals:
                 st.markdown("<div id='signals-list' class='signals-list'>", unsafe_allow_html=True)
                 for signal in signals:
@@ -606,7 +673,8 @@ with col3: # Right Pane (Signals Section)
                         st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
-                        st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4>\", unsafe_allow_html=True)
+                        # CORRECTED LINE HERE: removed the extra backslash
+                        st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4></div>", unsafe_allow_html=True) 
                         st.markdown(f"<p>{signal['argumentation']}</p></div>", unsafe_allow_html=True)
 
                 st.markdown("</div>", unsafe_allow_html=True)
