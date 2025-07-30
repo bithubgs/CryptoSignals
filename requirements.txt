@@ -1,1 +1,4 @@
-ÿş
+streamlit
+pandas
+plotly
+requests
