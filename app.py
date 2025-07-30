@@ -9,8 +9,30 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # Import forecasting models
-from statsmodels.tsa.arima.model import ARIMA
-from prophet import Prophet # Ensure you have prophet installed: pip install prophet
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+except ImportError:
+    st.warning("ARIMA მოდული ვერ მოიძებნა. დააინსტალირეთ 'statsmodels': pip install statsmodels")
+    ARIMA = None
+
+try:
+    from prophet import Prophet # Ensure you have prophet installed: pip install prophet
+except ImportError:
+    st.warning("Prophet მოდული ვერ მოიძებნა. დააინსტალირეთ 'prophet': pip install prophet")
+    Prophet = None
+
+try:
+    import numpy as np
+    from sklearn.preprocessing import MinMaxScaler
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+except ImportError:
+    st.warning("TensorFlow/Keras ან Scikit-learn მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy")
+    LSTM_AVAILABLE = False
+else:
+    LSTM_AVAILABLE = True
+
 
 # --- Set page config for wide mode ---
 st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
@@ -18,6 +40,9 @@ st.set_page_config(layout="wide", page_title="კრიპტო სიგნა
 # --- Configuration ---
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 API_CALL_INTERVAL = 1.2 # Coingecko allows 100 calls/minute, so ~1.2 seconds per call
+# Define a fixed historical data period for robust indicator calculation
+# This will be the *maximum* data fetched, then filtered by current_period for display
+MAX_HISTORICAL_DAYS = 365 # Fetch 1 year of data for MA99, RSI, MACD, and LSTM training
 
 COINGECKO_CRYPTO_MAP = {
     'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 'DOT': 'polkadot',
@@ -63,7 +88,7 @@ def fetch_coin_details(coingecko_id):
         return None
 
 @st.cache_data(ttl=3600) # Cache for 1 hour
-def fetch_historical_data_coingecko(coingecko_id, days=90):
+def fetch_historical_data_coingecko(coingecko_id, days=MAX_HISTORICAL_DAYS): # Always fetch MAX_HISTORICAL_DAYS
     try:
         rate_limit_api_call()
         url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/market_chart"
@@ -79,17 +104,18 @@ def fetch_historical_data_coingecko(coingecko_id, days=90):
 class CryptoDataForecaster:
     def __init__(self, symbol, historical_prices_df):
         self.symbol = symbol.upper()
-        # Ensure historical_prices is a DataFrame with 'date' as datetime and 'price' as float
         self.historical_prices = historical_prices_df.copy()
         self.historical_prices['date'] = pd.to_datetime(self.historical_prices['date'])
         self.historical_prices.set_index('date', inplace=True)
         self.historical_prices['price'] = self.historical_prices['price'].astype(float)
 
     def _generate_simulated_trend_predictions(self, days):
-        # This is the "original" model, simulating a future trend based on recent MA behavior.
-        # It's not a statistically rigorous forecast but can generate visually appealing signals.
-        if self.historical_prices.empty or len(self.historical_prices) < 20: # Need enough data for initial MAs
-            # Fallback to simple random walk if not enough data for MA-based simulation
+        """
+        Adjusted simulation model to be closer to "original" behavior:
+        More reactive to MA crossovers, then maintains a stronger trend.
+        """
+        if self.historical_prices.empty or len(self.historical_prices) < 99: # Need enough data for 99 MA for initialization
+            st.warning("საკმარისი მონაცემები არ არის 'სიმულირებული ტრენდი' მოდელისთვის. პროგნოზი დაფუძნებულია შეზღუდულ მონაცემებზე.")
             last_price = self.historical_prices['price'].iloc[-1] if not self.historical_prices.empty else 0
             last_date = self.historical_prices.index[-1] if not self.historical_prices.empty else datetime.date.today()
             
@@ -97,42 +123,114 @@ class CryptoDataForecaster:
             current_price = last_price
             for i in range(1, days + 1):
                 date = last_date + datetime.timedelta(days=i)
-                current_price *= (1 + random.uniform(-0.005, 0.005)) # Small random walk
+                current_price *= (1 + random.uniform(-0.01, 0.01)) # Larger random walk
                 current_price = max(0.00000001, current_price)
                 prediction_data.append({'date': date, 'price': round(current_price, 8), 'type': 'prediction'})
             return prediction_data
 
-        short_ma_hist = self.historical_prices['price'].rolling(window=7).mean() # Shorter window for recent trend
-        long_ma_hist = self.historical_prices['price'].rolling(window=25).mean() # Longer window for overall trend
-
-        last_short_ma = short_ma_hist.iloc[-1]
-        last_long_ma = long_ma_hist.iloc[-1]
+        ma7 = self.historical_prices['price'].rolling(window=7).mean().iloc[-1]
+        ma25 = self.historical_prices['price'].rolling(window=25).mean().iloc[-1]
+        ma99 = self.historical_prices['price'].rolling(window=99).mean().iloc[-1]
         last_price = self.historical_prices['price'].iloc[-1]
         last_date = self.historical_prices.index[-1]
 
         prediction_data = []
         current_predicted_price = last_price
 
-        # Determine initial trend direction
-        trend_bias = 0
-        if last_short_ma > last_long_ma:
-            trend_bias = 0.001 # Slight upward bias
-        elif last_short_ma < last_long_ma:
-            trend_bias = -0.001 # Slight downward bias
+        # Initial trend determination - more aggressive based on MA relationships
+        trend_factor = 0.00 # Base daily change
+        
+        # Determine initial strong bias based on MA crossovers
+        if ma7 > ma25 and ma25 > ma99: # Strong uptrend
+            trend_factor = 0.02 # Example: 2% daily increase potential
+        elif ma7 < ma25 and ma25 < ma99: # Strong downtrend
+            trend_factor = -0.02 # Example: 2% daily decrease potential
+        elif ma7 > ma25: # Mild uptrend
+            trend_factor = 0.005
+        elif ma7 < ma25: # Mild downtrend
+            trend_factor = -0.005
 
         for i in range(1, days + 1):
             date = last_date + datetime.timedelta(days=i)
             
-            # Add a trend component and controlled volatility
-            random_change = random.uniform(-0.008, 0.008) # Controlled random fluctuations
-            current_predicted_price *= (1 + trend_bias + random_change)
+            # Add volatility, but keep the trend
+            volatility_factor = random.uniform(0.98, 1.02) # +/- 2% daily fluctuation
+            
+            # Apply the trend factor and volatility
+            current_predicted_price *= (1 + trend_factor) * volatility_factor
             current_predicted_price = max(0.00000001, current_predicted_price) # Prevent negative prices
             
             prediction_data.append({'date': date, 'price': round(current_predicted_price, 8), 'type': 'prediction'})
-            
-            # The trend_bias for the simulated model remains relatively constant or evolves slowly
-            # based on initial conditions, not dynamically on generated future prices.
+        
         return prediction_data
+
+    def _generate_lstm_predictions(self, days):
+        if not LSTM_AVAILABLE:
+            st.error("LSTM მოდელი არ არის ხელმისაწვდომი (საჭიროა TensorFlow/Keras). გამოიყენება სიმულირებული ტრენდი.")
+            return self._generate_simulated_trend_predictions(days)
+        
+        # LSTM needs a longer history for training.
+        # We need to reshape data for LSTM (samples, timesteps, features)
+        look_back = 60 # Number of previous days to consider for prediction
+        
+        if len(self.historical_prices) < look_back + 1:
+            st.warning(f"არასაკმარისი მონაცემები LSTM პროგნოზისთვის (მინიმუმ {look_back + 1} დღე). გამოიყენება სიმულირებული ტრენდი.")
+            return self._generate_simulated_trend_predictions(days)
+        
+        data = self.historical_prices['price'].values.reshape(-1, 1) # Reshape to (n_samples, 1)
+
+        # Scale data
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler.fit_transform(data)
+
+        # Create dataset for LSTM
+        X, y = [], []
+        for i in range(len(scaled_data) - look_back):
+            X.append(scaled_data[i:(i + look_back), 0])
+            y.append(scaled_data[i + look_back, 0])
+        X = np.array(X)
+        y = np.array(y)
+
+        # Reshape X for LSTM input (samples, time_steps, features)
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+
+        # Build LSTM model (simple architecture for demonstration)
+        model = Sequential()
+        model.add(LSTM(units=50, return_sequences=True, input_shape=(look_back, 1)))
+        model.add(Dropout(0.2))
+        model.add(LSTM(units=50, return_sequences=False))
+        model.add(Dropout(0.2))
+        model.add(Dense(units=1)) # Output layer for single price prediction
+
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+
+        # Train model (using a small number of epochs for speed in Streamlit)
+        try:
+            # Verbose=0 to prevent verbose output in Streamlit
+            model.fit(X, y, epochs=20, batch_size=1, verbose=0) 
+        except Exception as e:
+            st.error(f"შეცდომა LSTM მოდელის ტრენინგისას: {e}. გამოიყენება სიმულირებული ტრენდი.")
+            return self._generate_simulated_trend_predictions(days)
+
+        # Make predictions
+        last_look_back_data = scaled_data[-look_back:]
+        prediction_list = []
+        current_input = last_look_back_data.reshape(1, look_back, 1)
+
+        last_date = self.historical_prices.index[-1]
+
+        for i in range(days):
+            predicted_scaled_price = model.predict(current_input, verbose=0)[0, 0]
+            predicted_price = scaler.inverse_transform([[predicted_scaled_price]])[0, 0]
+            
+            date = last_date + datetime.timedelta(days=i+1)
+            prediction_list.append({'date': date, 'price': max(0.00000001, round(predicted_price, 8)), 'type': 'prediction'})
+            
+            # Update current_input for next prediction (sliding window)
+            current_input = np.append(current_input[:, 1:, :], [[predicted_scaled_price]], axis=1)
+        
+        return prediction_list
+
 
     def generate_predictions(self, days=30, model_choice="Simulated Trend (MA-based)"):
         if self.historical_prices.empty:
@@ -140,27 +238,25 @@ class CryptoDataForecaster:
             return []
 
         prediction_data = []
-        last_date = self.historical_prices.index[-1]
         
         if model_choice == "Simulated Trend (MA-based)":
             prediction_data = self._generate_simulated_trend_predictions(days)
             
         elif model_choice == "ARIMA Model":
-            # ARIMA is more sensitive to data length and stationarity.
-            # It's likely to produce more "flat" or "trending" forecasts without
-            # sophisticated parameter tuning and residual analysis.
-            if len(self.historical_prices) < 90: # ARIMA often needs more data, 90 days for better chance
+            if ARIMA is None:
+                st.error("ARIMA მოდული არ არის ხელმისაწვდომი. გამოიყენება სიმულირებული ტრენდი.")
+                return self._generate_simulated_trend_predictions(days)
+            if len(self.historical_prices) < 90:
                 st.warning("არასაკმარისი მონაცემები ARIMA პროგნოზისთვის (მინიმუმ 90 დღე). გამოიყენება სიმულირებული ტრენდი.")
                 return self._generate_simulated_trend_predictions(days)
 
             series = self.historical_prices['price']
             try:
-                # Order (p,d,q) chosen as a common starting point. d=1 for differencing.
                 model = ARIMA(series, order=(5,1,0)) 
                 model_fit = model.fit()
-                
                 forecast_result = model_fit.predict(start=len(series), end=len(series) + days - 1)
                 
+                last_date = self.historical_prices.index[-1]
                 for i, price in enumerate(forecast_result):
                     date = last_date + datetime.timedelta(days=i+1)
                     prediction_data.append({'date': date, 'price': max(0.00000001, round(price, 8)), 'type': 'prediction'})
@@ -169,9 +265,10 @@ class CryptoDataForecaster:
                 return self._generate_simulated_trend_predictions(days)
 
         elif model_choice == "Prophet Model":
-            # Prophet is robust to missing data and outliers but might require holiday/event definitions
-            # for accurate crypto forecasting.
-            if len(self.historical_prices) < 90: # Prophet also prefers more data, 90 days for better chance
+            if Prophet is None:
+                st.error("Prophet მოდული არ არის ხელმისაწვდომი. გამოიყენება სიმულირებული ტრენდი.")
+                return self._generate_simulated_trend_predictions(days)
+            if len(self.historical_prices) < 90:
                 st.warning("არასაკმარისი მონაცემები Prophet პროგნოზისთვის (მინიმუმ 90 დღე). გამოიყენება სიმულირებული ტრენდი.")
                 return self._generate_simulated_trend_predictions(days)
 
@@ -179,27 +276,28 @@ class CryptoDataForecaster:
             df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
 
             try:
-                # Increased changepoint_prior_scale for more flexibility
                 model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, changepoint_prior_scale=0.05) 
                 model.fit(df_prophet)
-                
                 future = model.make_future_dataframe(periods=days)
                 forecast = model.predict(future)
                 
                 for _, row in forecast.tail(days).iterrows():
                     prediction_data.append({
                         'date': row['ds'], 
-                        'price': max(0.00000001, round(row['yhat'], 8)), # yhat is the prediction
+                        'price': max(0.00000001, round(row['yhat'], 8)), 
                         'type': 'prediction'
                     })
             except Exception as e:
                 st.error(f"შეცდომა Prophet მოდელის გაშვებისას: {e}. გამოიყენება სიმულირებული ტრენდი.")
                 return self._generate_simulated_trend_predictions(days)
+
+        elif model_choice == "LSTM Model":
+            prediction_data = self._generate_lstm_predictions(days)
         
         return prediction_data
 
     def generate_signals_from_prediction(self, prediction_data):
-        if len(prediction_data) < 7: # Need at least 7 days for 7-day MA
+        if len(prediction_data) < 7:
             return []
         
         df_prediction = pd.DataFrame(prediction_data)
@@ -207,35 +305,30 @@ class CryptoDataForecaster:
         df_prediction.set_index('date', inplace=True)
         df_prediction['price'] = df_prediction['price'].astype(float)
 
-        # Calculate Moving Averages on predicted data
-        short_window = 3 # e.g., 3-day MA for signals
-        long_window = 7  # e.g., 7-day MA for signals
+        short_window = 3 
+        long_window = 7  
 
         df_prediction['MA_short'] = df_prediction['price'].rolling(window=short_window).mean()
         df_prediction['MA_long'] = df_prediction['price'].rolling(window=long_window).mean()
 
         signals = []
-        # Look for moving average crossovers
         for i in range(1, len(df_prediction)):
             current_date = df_prediction.index[i]
-            # Ensure we have enough data points for MAs
             if pd.isna(df_prediction['MA_short'].iloc[i]) or pd.isna(df_prediction['MA_long'].iloc[i]):
-                continue # Skip if MAs are not yet calculated
+                continue 
 
             if (df_prediction['MA_short'].iloc[i-1] < df_prediction['MA_long'].iloc[i-1] and
                 df_prediction['MA_short'].iloc[i] > df_prediction['MA_long'].iloc[i]):
-                # Buy signal: Short MA crosses above Long MA
                 signals.append({
                     'date': current_date,
                     'type': 'BUY',
                     'price': df_prediction['price'].iloc[i],
-                    'confidence': f"{random.randint(70, 90)}%", # Higher confidence for MA signals
+                    'confidence': f"{random.randint(70, 90)}%",
                     'argumentation': f"AI პროგნოზირებს მოკლევადიანი მოძრავი საშუალოს (MA{short_window}) გრძელვადიან მოძრავ საშუალოზე (MA{long_window}) ზემოთ კვეთას, რაც პოტენციური აღმავალი ტრენდის დასაწყისს მიანიშნებს."
                 })
 
             elif (df_prediction['MA_short'].iloc[i-1] > df_prediction['MA_long'].iloc[i-1] and
                   df_prediction['MA_short'].iloc[i] < df_prediction['MA_long'].iloc[i]):
-                # Sell signal: Short MA crosses below Long MA
                 signals.append({
                     'date': current_date,
                     'type': 'SELL',
@@ -249,17 +342,20 @@ class CryptoDataForecaster:
     def calculate_technical_indicators(self):
         df_hist = self.historical_prices.copy()
         
-        # Moving Averages (MA)
+        # Moving Averages (MA) - calculated on historical data
         df_hist['MA7'] = df_hist['price'].rolling(window=7).mean()
         df_hist['MA25'] = df_hist['price'].rolling(window=25).mean()
-        df_hist['MA99'] = df_hist['price'].rolling(window=99).mean() # Consider if 99 days of history is always available
+        df_hist['MA99'] = df_hist['price'].rolling(window=99).mean()
 
         # RSI Calculation (Standard: 14 periods)
         delta = df_hist['price'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
+        
+        # Handle division by zero for RS
+        rs = gain / loss.replace(0, pd.NA).fillna(pd.NA)
         df_hist['RSI'] = 100 - (100 / (1 + rs))
+        df_hist['RSI'].fillna(0, inplace=True) # Fill initial NaNs with 0 or last valid value if preferred
 
         # MACD Calculation (Standard: EMA 12, EMA 26, Signal EMA 9)
         exp1 = df_hist['price'].ewm(span=12, adjust=False).mean()
@@ -464,7 +560,7 @@ st.markdown("""
 if 'current_symbol' not in st.session_state:
     st.session_state.current_symbol = 'SAND'
 if 'current_period' not in st.session_state:
-    st.session_state.current_period = 90
+    st.session_state.current_period = 90 # Default display period
 if 'prediction_model' not in st.session_state:
     st.session_state.prediction_model = "Simulated Trend (MA-based)" # Default model now the "original" one
 
@@ -547,16 +643,19 @@ with col2: # Center Pane (Chart Section)
         
         # Time Filters and Model Selection
         filter_cols = st.columns(3)
-        periods = [90, 30, 7]
+        periods = [90, 30, 7] # Display filter options
         for i, period in enumerate(periods):
             with filter_cols[i]:
                 if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True, type="secondary" if st.session_state.current_period != period else "primary"):
                     st.session_state.current_period = period
-                    st.toast(f"Fetching data for {st.session_state.current_symbol} for {period} days...")
-                    st.rerun()
+                    st.toast(f"Showing {period} days data for {st.session_state.current_symbol}...")
+                    # No rerun needed here, as chart data is filtered below
         
         # Model Selection
         model_options = ["Simulated Trend (MA-based)", "ARIMA Model", "Prophet Model"]
+        if LSTM_AVAILABLE:
+            model_options.append("LSTM Model")
+
         selected_model = st.selectbox(
             "აირჩიეთ პროგნოზირების მოდელი:",
             model_options,
@@ -564,29 +663,38 @@ with col2: # Center Pane (Chart Section)
         )
         if selected_model != st.session_state.prediction_model:
             st.session_state.prediction_model = selected_model
-            st.rerun()
+            st.rerun() # Rerun when model changes to regenerate predictions
 
         # Chart
         if coingecko_id and coin_details:
-            historical_data_list = fetch_historical_data_coingecko(coingecko_id, days=st.session_state.current_period)
-            if historical_data_list:
-                df_historical = pd.DataFrame(historical_data_list)
+            # Always fetch MAX_HISTORICAL_DAYS for indicator calculation robustness
+            historical_data_list_full = fetch_historical_data_coingecko(coingecko_id, days=MAX_HISTORICAL_DAYS)
+            
+            if historical_data_list_full:
+                df_historical_full = pd.DataFrame(historical_data_list_full)
                 
-                forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
+                # Filter historical data for display based on current_period
+                df_historical_display = df_historical_full.tail(st.session_state.current_period).copy()
+                df_historical_display['date'] = pd.to_datetime(df_historical_display['date'])
+                df_historical_display.set_index('date', inplace=True)
+
+                forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical_full) # Use full data for forecaster
                 
-                # Get predicted data based on selected model
-                prediction_data_list = forecaster.generate_predictions(model_choice=st.session_state.prediction_model)
+                # Get predicted data based on selected model (always predict for 30 days)
+                with st.spinner(f"მიმდინარეობს {st.session_state.prediction_model} პროგნოზირება..."):
+                    prediction_data_list = forecaster.generate_predictions(days=30, model_choice=st.session_state.prediction_model)
                 df_prediction = pd.DataFrame(prediction_data_list)
+                df_prediction['date'] = pd.to_datetime(df_prediction['date']) # Ensure datetime
                 
                 # Get signals from prediction
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
-                # Calculate technical indicators for historical data
+                # Calculate technical indicators for the *full* historical data
                 df_indicators = forecaster.calculate_technical_indicators()
+                # Then, filter indicators for display based on current_period
+                df_indicators_display = df_indicators.tail(st.session_state.current_period)
 
                 # --- Create Plotly Subplots ---
-                # Define row heights (main chart larger, indicators smaller)
-                # 3 rows: Price + MAs + Prediction, RSI, MACD
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
                                     vertical_spacing=0.08, 
                                     row_heights=[0.6, 0.2, 0.2],
@@ -599,8 +707,8 @@ with col2: # Center Pane (Chart Section)
                 # --- Row 1: Price, MAs, Prediction ---
                 # Historical Price
                 fig.add_trace(go.Scatter(
-                    x=df_historical.index,
-                    y=df_historical['price'],
+                    x=df_historical_display.index,
+                    y=df_historical_display['price'],
                     mode='lines',
                     name='ისტორია',
                     line=dict(color='#00bcd4', width=2)
@@ -608,31 +716,31 @@ with col2: # Center Pane (Chart Section)
 
                 # Prediction Data
                 fig.add_trace(go.Scatter(
-                    x=df_prediction['date'], # df_prediction's date column is not index
+                    x=df_prediction['date'],
                     y=df_prediction['price'],
                     mode='lines',
                     name='პროგნოზი',
                     line=dict(color='#8e2de2', dash='dot', width=2)
                 ), row=1, col=1)
 
-                # Moving Averages on Historical Data
+                # Moving Averages on Historical Data (filtered for display)
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['MA7'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['MA7'],
                     mode='lines',
                     name='MA(7)',
                     line=dict(color='yellow', width=1, dash='solid')
                 ), row=1, col=1)
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['MA25'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['MA25'],
                     mode='lines',
                     name='MA(25)',
                     line=dict(color='orange', width=1, dash='solid')
                 ), row=1, col=1)
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['MA99'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['MA99'],
                     mode='lines',
                     name='MA(99)',
                     line=dict(color='lightgreen', width=1, dash='solid')
@@ -641,33 +749,35 @@ with col2: # Center Pane (Chart Section)
                 # Add Signals as Scatter points with text labels on Row 1
                 for signal in signals:
                     signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
-                    fig.add_trace(go.Scatter(
-                        x=[signal['date']],
-                        y=[signal['price']],
-                        mode='markers+text', # Add text to markers
-                        name=f"{signal['type']} სიგნალი",
-                        marker=dict(
-                            symbol='circle-open', # Use an open circle for better visibility
-                            size=14, 
-                            color=signal_color,
-                            line=dict(width=2, color=signal_color) 
-                        ),
-                        text=[signal['type']], # Text to display (BUY/SELL)
-                        textposition="top center" if signal['type'] == 'BUY' else "bottom center", # Position text above/below
-                        textfont=dict(
-                            family="sans-serif",
-                            size=12,
-                            color=signal_color
-                        ),
-                        hoverinfo='text',
-                        hovertext=f"<b>{signal['type']}</b><br>თარიღი: {signal['date'].strftime('%Y-%m-%d')}<br>ფასი: {format_price(signal['price'])} $",
-                        showlegend=False # Don't duplicate legend entry if already handled by main trace
-                    ), row=1, col=1)
+                    # Only show signals if they fall within the current display period or prediction period
+                    if signal['date'] >= df_historical_display.index.min():
+                        fig.add_trace(go.Scatter(
+                            x=[signal['date']],
+                            y=[signal['price']],
+                            mode='markers+text',
+                            name=f"{signal['type']} სიგნალი",
+                            marker=dict(
+                                symbol='circle-open',
+                                size=14, 
+                                color=signal_color,
+                                line=dict(width=2, color=signal_color) 
+                            ),
+                            text=[signal['type']],
+                            textposition="top center" if signal['type'] == 'BUY' else "bottom center",
+                            textfont=dict(
+                                family="sans-serif",
+                                size=12,
+                                color=signal_color
+                            ),
+                            hoverinfo='text',
+                            hovertext=f"<b>{signal['type']}</b><br>თარიღი: {signal['date'].strftime('%Y-%m-%d')}<br>ფასი: {format_price(signal['price'])} $",
+                            showlegend=False
+                        ), row=1, col=1)
 
                 # --- Row 2: RSI ---
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['RSI'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['RSI'],
                     mode='lines',
                     name='RSI',
                     line=dict(color='cyan', width=2)
@@ -677,24 +787,24 @@ with col2: # Center Pane (Chart Section)
 
                 # --- Row 3: MACD ---
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['MACD'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['MACD'],
                     mode='lines',
                     name='MACD Line',
                     line=dict(color='blue', width=2)
                 ), row=3, col=1)
                 fig.add_trace(go.Scatter(
-                    x=df_indicators.index,
-                    y=df_indicators['Signal_Line'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['Signal_Line'],
                     mode='lines',
                     name='Signal Line',
                     line=dict(color='purple', width=1)
                 ), row=3, col=1)
                 fig.add_trace(go.Bar(
-                    x=df_indicators.index,
-                    y=df_indicators['MACD_Histogram'],
+                    x=df_indicators_display.index,
+                    y=df_indicators_display['MACD_Histogram'],
                     name='MACD Histogram',
-                    marker_color=['red' if val < 0 else 'green' for val in df_indicators['MACD_Histogram']],
+                    marker_color=['red' if val < 0 else 'green' for val in df_indicators_display['MACD_Histogram']],
                     opacity=0.6
                 ), row=3, col=1)
                 fig.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
@@ -702,8 +812,8 @@ with col2: # Center Pane (Chart Section)
 
                 # --- Update Layout ---
                 fig.update_layout(
-                    height=700, # Adjust overall chart height
-                    xaxis_rangeslider_visible=False, # Hide rangeslider for cleaner look
+                    height=700,
+                    xaxis_rangeslider_visible=False,
                     template='plotly_dark',
                     hovermode='x unified',
                     margin=dict(l=0, r=0, t=50, b=0),
@@ -713,7 +823,7 @@ with col2: # Center Pane (Chart Section)
                     legend=dict(
                         orientation="h",
                         yanchor="top",
-                        y=1.05, # Position legend above the main plot
+                        y=1.05,
                         xanchor="left",
                         x=0,
                         bgcolor='rgba(0,0,0,0)',
@@ -721,9 +831,8 @@ with col2: # Center Pane (Chart Section)
                         font=dict(color=st.get_option('theme.textColor'))
                     )
                 )
-                # Update individual subplot axes
                 fig.update_yaxes(title_text='ფასი (USD)', row=1, col=1)
-                fig.update_yaxes(title_text='RSI', range=[0, 100], row=2, col=1) # RSI fixed range
+                fig.update_yaxes(title_text='RSI', range=[0, 100], row=2, col=1)
                 fig.update_yaxes(title_text='MACD', row=3, col=1)
                 fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=1, col=1)
                 fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=2, col=1)
@@ -736,6 +845,9 @@ with col2: # Center Pane (Chart Section)
                 <div class="chart-legend">
                     <div class="legend-item"><div class="legend-color historical"></div><span>ისტორია</span></div>
                     <div class="legend-item"><div class="legend-color prediction"></div><span>პროგნოზი</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background-color: yellow;"></div><span>MA(7)</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background-color: orange;"></div><span>MA(25)</span></div>
+                    <div class="legend-item"><div class="legend-color" style="background-color: lightgreen;"></div><span>MA(99)</span></div>
                     <div class="legend-item"><div class="legend-color buy-signal-legend"></div><span>ყიდვა</span></div>
                     <div class="legend-item"><div class="legend-color sell-signal-legend"></div><span>გაყიდვა</span></div>
                 </div>
@@ -746,9 +858,10 @@ with col2: # Center Pane (Chart Section)
                 
                 st.markdown("""
                 <div class="argumentation-box">
-                    <p><span class='modal-label'>მოძრავი საშუალო (MA):</span> მოძრავი საშუალო აჩვენებს ფასის საშუალო მნიშვნელობას განსაზღვრულ პერიოდში (მაგ., 7, 25, 99 დღე). ის ტრენდის იდენტიფიცირებას უწყობს ხელს. მოკლევადიანი MA-ს (MA7) გრძელვადიან MA-ზე (MA25/MA99) ზემოთ კვეთა აღმავალი ტრენდის სიგნალია (Golden Cross), ხოლო ქვემოთ კვეთა - დაღმავალი ტრენდის (Death Cross).</p>
-                    <p><span class='modal-label'>Relative Strength Index (RSI):</span> RSI არის იმპულსის ოსცილატორი, რომელიც ზომავს ფასის ცვლილებების სიჩქარესა და ცვლილებას. ის მერყეობს 0-დან 100-მდე. 70-ზე ზემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Overbought) და შესაძლოა ფასის კორექცია მოხდეს. 30-ზე ქვემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Oversold) და შესაძლოა ფასის ზრდა დაიწყოს.</p>
-                    <p><span class='modal-label'>Moving Average Convergence Divergence (MACD):</span> MACD არის ტრენდის მიმდევარი იმპულსის ინდიკატორი, რომელიც აჩვენებს ფასის ორ მოძრავ საშუალოს (ჩვეულებრივ, 12-დღიანი და 26-დღიანი ექსპონენციალური მოძრავი საშუალო) შორის ურთიერთობას. MACD ხაზის სასიგნალო ხაზის (9-დღიანი MACD-ის MA) ზემოთ კვეთა არის ყიდვის სიგნალი, ხოლო ქვემოთ კვეთა - გაყიდვის სიგნალი. ჰისტოგრამა აჩვენებს MACD ხაზსა და სასიგნალო ხაზს შორის განსხვავებას.</p>
+                    <p><span class='modal-label'>მოძრავი საშუალო (MA):</span> მოძრავი საშუალო (Moving Average) აჩვენებს ფასის საშუალო მნიშვნელობას განსაზღვრულ პერიოდში (მაგ., 7, 25, 99 დღე). ის გამოიყენება ტრენდის იდენტიფიცირებისთვის და ფასის "ხმაურის" გასაგლუვებლად. მოკლევადიანი MA-ს გრძელვადიან MA-ზე ზემოთ კვეთა (ე.წ. Golden Cross) განიხილება აღმავალი ტრენდის სიგნალად, ხოლო ქვემოთ კვეთა (Death Cross) - დაღმავალი ტრენდის სიგნალად.</p>
+                    <p><span class='modal-label'>Relative Strength Index (RSI):</span> RSI არის იმპულსის ოსცილატორი, რომელიც ზომავს ფასის ცვლილებების სიჩქარესა და ცვლილებას. ის მერყეობს 0-დან 100-მდე. 70-ზე ზემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Overbought) და შესაძლოა ფასის კორექცია მოხდეს. 30-ზე ქვემოთ ნიშნავს, რომ აქტივი ზედმეტად გაყიდულია (Oversold) და შესაძლოა ფასის ზრდა დაიწყოს.</p>
+                    <p><span class='modal-label'>Moving Average Convergence Divergence (MACD):</span> MACD არის ტრენდის მიმდევარი იმპულსის ინდიკატორი, რომელიც აჩვენებს ფასის ორ ექსპონენციალურ მოძრავ საშუალოს (EMA) შორის ურთიერთობას (ჩვეულებრივ, 12-დღიანი და 26-დღიანი EMA). MACD ხაზის სასიგნალო ხაზის (9-დღიანი MACD-ის EMA) ზემოთ კვეთა არის ყიდვის სიგნალი, ხოლო ქვემოთ კვეთა - გაყიდვის სიგნალი. MACD ჰისტოგრამა აჩვენებს MACD ხაზსა და სასიგნალო ხაზს შორის განსხვავებას და გამოიყენება იმპულსის სიმძლავრის გასაზომად.</p>
+                    <p><span class='modal-label'>LSTM (Long Short-Term Memory):</span> LSTM არის ხელოვნური ნერონული ქსელის სპეციალური ტიპი, რომელიც განსაკუთრებით ეფექტურია დროითი სერიების მონაცემების დასამუშავებლად და პროგნოზირებისთვის. მას შეუძლია ისწავლოს დამოკიდებულებები მონაცემებში როგორც მოკლე, ასევე გრძელვადიან პერსპექტივაში, რაც მას სასარგებლოს ხდის კომპლექსური ფინანსური მონაცემების მოდელირებისთვის.
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -762,12 +875,12 @@ with col3: # Right Pane (Signals Section)
     with st.container(border=False): # Use container to mimic card styling
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
         
-        if coingecko_id and coin_details and historical_data_list:
-            df_historical = pd.DataFrame(historical_data_list) # Re-create DataFrame for consistency
-            forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
+        if coingecko_id and coin_details and historical_data_list_full:
+            df_historical_full = pd.DataFrame(historical_data_list_full)
+            forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical_full)
             
-            # Pass the selected model to generate_predictions
-            prediction_data_list = forecaster.generate_predictions(model_choice=st.session_state.prediction_model)
+            with st.spinner(f"გენერირდება სიგნალები {st.session_state.prediction_model} მოდელიდან..."):
+                prediction_data_list = forecaster.generate_predictions(days=30, model_choice=st.session_state.prediction_model)
             signals = forecaster.generate_signals_from_prediction(prediction_data_list)
             
             if signals:
@@ -786,13 +899,12 @@ with col3: # Right Pane (Signals Section)
                     </div>
                     """, unsafe_allow_html=True)
 
-                    # Show signal details in an expander instead of a modal
                     with st.expander(f"დეტალები: {signal['type']} {signal['date'].strftime('%Y-%m-%d')}"):
                         st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
                         st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4></div>", unsafe_allow_html=True) 
-                        st.markdown(f"<p>{signal['argumentation']}</p></div>", unsafe_allow_html=True)
+                        st.markdown(f"<p>{signal['argumentation']}</p>", unsafe_allow_html=True)
 
                 st.markdown("</div>", unsafe_allow_html=True)
             else:
