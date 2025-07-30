@@ -4,3 +4,6 @@ pandas
 plotly
 statsmodels
 prophet
+numpy
+scikit-learn
+tensorflow
