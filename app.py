@@ -11,30 +11,32 @@ import os
 import numpy as np
 
 # Import forecasting models with checks
+ARIMA_AVAILABLE = False
 try:
     from statsmodels.tsa.arima.model import ARIMA
 except ImportError:
-    st.error("ARIMA მოდული ვერ მოიძებნა. დააინსტალირეთ 'statsmodels': pip install statsmodels")
-    ARIMA_AVAILABLE = False
+    st.error("statsmodels.tsa.arima მოდული ვერ მოიძებნა. ARIMA პროგნოზირების მოდელი არ იქნება ხელმისაწვდომი.")
 else:
     ARIMA_AVAILABLE = True
 
-try:
-    from pmdarima import auto_arima
-except ImportError:
-    st.error("pmdarima მოდული ვერ მოიძებნა. დააინსტალირეთ 'pmdarima': pip install pmdarima")
-    AUTO_ARIMA_AVAILABLE = False
-else:
-    AUTO_ARIMA_AVAILABLE = True
+AUTO_ARIMA_AVAILABLE = False
+if ARIMA_AVAILABLE: # Only try importing auto_arima if ARIMA is available
+    try:
+        from pmdarima import auto_arima
+    except Exception as e: # Catch a broader exception for installation issues on Streamlit Cloud
+        st.error(f"pmdarima მოდული ვერ ჩაიტვირთა. ARIMA-ს ავტომატური პარამეტრების ძიება არ იქნება ხელმისაწვდომი. შეცდომა: {e}")
+    else:
+        AUTO_ARIMA_AVAILABLE = True
 
+PROPHET_AVAILABLE = False
 try:
     from prophet import Prophet
 except ImportError:
-    st.error("Prophet მოდული ვერ მოიძებნა. დააინსტალირეთ 'prophet': pip install prophet")
-    PROPHET_AVAILABLE = False
+    st.error("Prophet მოდული ვერ მოიძებნა. Prophet პროგნოზირების მოდელი არ იქნება ხელმისაწვდომი. დააინსტალირეთ 'prophet': pip install prophet")
 else:
     PROPHET_AVAILABLE = True
 
+LSTM_AVAILABLE = False
 try:
     from sklearn.preprocessing import MinMaxScaler
     from tensorflow.keras.models import Sequential
@@ -45,8 +47,7 @@ try:
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR') # Only show errors
 except ImportError:
-    st.error("TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy")
-    LSTM_AVAILABLE = False
+    st.error("TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. LSTM პროგნოზირების მოდელი არ იქნება ხელმისაწვდომი.")
 else:
     LSTM_AVAILABLE = True
 
@@ -55,7 +56,7 @@ st.set_page_config(layout="wide", page_title="კრიპტო სიგნა
 
 # --- Configuration ---
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
-API_CALL_INTERVAL = 2.5 # Increased to be safer against 429 errors
+API_CALL_INTERVAL = 2.5 # Increased to be safer against 429 errors (Coingecko 100 calls/min is avg 0.6s/call)
 MAX_HISTORICAL_DAYS = 1800 # Fetch approx 5 years of data for robust models
 
 COINGECKO_CRYPTO_MAP = {
@@ -145,6 +146,8 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
 
     if db_data:
         latest_date_in_db = max([row[0] for row in db_data])
+        # Check if the latest date in DB is today and we have enough historical points
+        # Using today's date for exact match for simple cache validation
         if datetime.datetime.strptime(latest_date_in_db, '%Y-%m-%d').date() == datetime.date.today() and len(db_data) >= days:
             st.toast(f"ისტორიული მონაცემები ჩაიტვირთა SQLite ქეშიდან: {coingecko_id}", icon="💾")
             historical_data = [{'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'), 'price': row[1], 'type': 'historical'} for row in db_data]
@@ -178,6 +181,7 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
         if len(fetched_historical_data) > days:
             fetched_historical_data = fetched_historical_data[-days:]
 
+        # Insert/update fetched data into DB
         for entry in fetched_historical_data:
             cursor.execute('''
                 INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price)
@@ -210,7 +214,12 @@ class CryptoDataForecaster:
         self.historical_prices.set_index('date', inplace=True)
         self.historical_prices['price'] = self.historical_prices['price'].astype(float)
         
-        self.historical_with_features = self.calculate_features_and_indicators()
+        # Calculate features only if there's enough data
+        if len(self.historical_prices) > 100: # Arbitrary threshold for meaningful features
+            self.historical_with_features = self.calculate_features_and_indicators()
+        else:
+            self.historical_with_features = self.historical_prices.copy()
+
 
     def calculate_features_and_indicators(self):
         df_hist = self.historical_prices.copy()
@@ -222,23 +231,36 @@ class CryptoDataForecaster:
         df_hist['MA25'] = df_hist['price'].rolling(window=25, min_periods=1).mean()
         df_hist['MA99'] = df_hist['price'].rolling(window=99, min_periods=1).mean()
 
+        # RSI Calculation
         delta = df_hist['price'].diff()
         gain = (delta.where(delta > 0, 0))
         loss = (-delta.where(delta < 0, 0))
         
-        avg_gain = gain.ewm(span=14, adjust=False, min_periods=14).mean()
-        avg_loss = loss.ewm(span=14, adjust=False, min_periods=14).mean()
-        
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        df_hist['RSI'] = 100 - (100 / (1 + rs))
-        df_hist['RSI'].fillna(0, inplace=True) 
-        df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0)
+        # Use simple moving average for initial RSI if not enough periods for EWM
+        # For full RSI calculation, ensure at least 14 periods of data
+        if len(df_hist) >= 14:
+            avg_gain = gain.ewm(span=14, adjust=False, min_periods=14).mean()
+            avg_loss = loss.ewm(span=14, adjust=False, min_periods=14).mean()
+            rs = avg_gain / avg_loss.replace(0, np.nan)
+            df_hist['RSI'] = 100 - (100 / (1 + rs))
+            df_hist['RSI'].fillna(0, inplace=True) 
+            df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0)
+        else:
+            df_hist['RSI'] = 0 # Default to 0 if not enough data
 
-        exp1 = df_hist['price'].ewm(span=12, adjust=False, min_periods=12).mean()
-        exp2 = df_hist['price'].ewm(span=26, adjust=False, min_periods=26).mean()
-        df_hist['MACD'] = exp1 - exp2
-        df_hist['Signal_Line'] = df_hist['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
-        df_hist['MACD_Histogram'] = df_hist['MACD'] - df_hist['Signal_Line']
+        # MACD Calculation
+        # For full MACD calculation, ensure at least 26 periods of data
+        if len(df_hist) >= 26:
+            exp1 = df_hist['price'].ewm(span=12, adjust=False, min_periods=12).mean()
+            exp2 = df_hist['price'].ewm(span=26, adjust=False, min_periods=26).mean()
+            df_hist['MACD'] = exp1 - exp2
+            df_hist['Signal_Line'] = df_hist['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
+            df_hist['MACD_Histogram'] = df_hist['MACD'] - df_hist['Signal_Line']
+        else:
+            df_hist['MACD'] = 0
+            df_hist['Signal_Line'] = 0
+            df_hist['MACD_Histogram'] = 0
+
 
         df_hist['day_of_week'] = df_hist.index.dayofweek
         df_hist['day_of_month'] = df_hist.index.day
@@ -442,9 +464,9 @@ class CryptoDataForecaster:
         return prediction_data
 
     def generate_signals_from_prediction(self, prediction_data):
-        if len(prediction_data) < 7:
+        if not prediction_data:
             return []
-        
+            
         df_prediction = pd.DataFrame(prediction_data)
         df_prediction['date'] = pd.to_datetime(df_prediction['date'])
         df_prediction.set_index('date', inplace=True)
@@ -452,6 +474,10 @@ class CryptoDataForecaster:
 
         short_window = 3 
         long_window = 7 
+
+        # Ensure we have enough data for MA calculations
+        if len(df_prediction) < long_window:
+            return [] # Not enough data for meaningful signals
 
         df_prediction['MA_short'] = df_prediction['price'].rolling(window=short_window).mean()
         df_prediction['MA_long'] = df_prediction['price'].rolling(window=long_window).mean()
@@ -677,7 +703,7 @@ if 'current_symbol' not in st.session_state:
 if 'current_period' not in st.session_state:
     st.session_state.current_period = 90
 if 'prediction_model' not in st.session_state:
-    st.session_state.prediction_model = "ARIMA Model"
+    st.session_state.prediction_model = "ARIMA Model" # Default if available
 
 col1, col2, col3 = st.columns([0.8, 1.5, 0.8])
 
@@ -769,19 +795,16 @@ with col2:
             model_options.append("LSTM Model")
 
         if not model_options:
-            st.error("არცერთი პროგნოზირების მოდული არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ საჭირო ბიბლიოთეკები.")
+            st.error("არცერთი პროგნოზირების მოდული არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ საჭირო ბიბლიოთეკები (იხ. requirements.txt).")
         else:
-            try:
-                current_model_index = model_options.index(st.session_state.prediction_model)
-            except ValueError:
-                # Fallback if the previously selected model is no longer available
-                current_model_index = 0 
-                st.session_state.prediction_model = model_options[0]
+            # Set default model if current one is not available
+            if st.session_state.prediction_model not in model_options:
+                st.session_state.prediction_model = model_options[0] # Fallback to first available
 
             selected_model = st.selectbox(
                 "აირჩიეთ პროგნოზირების მოდელი:",
                 model_options,
-                index=current_model_index
+                index=model_options.index(st.session_state.prediction_model) # Use current selected model's index
             )
             if selected_model != st.session_state.prediction_model:
                 st.session_state.prediction_model = selected_model
@@ -808,6 +831,7 @@ with col2:
                 
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
+                # Filter historical features for display based on selected period
                 df_indicators_display = forecaster.historical_with_features.tail(st.session_state.current_period).copy()
                 
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
@@ -819,6 +843,7 @@ with col2:
                                         "Moving Average Convergence Divergence (MACD)"
                                     ))
 
+                # Price and Prediction Plot (Row 1)
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['price'],
@@ -858,9 +883,11 @@ with col2:
                     line=dict(color='lightgreen', width=1, dash='solid')
                 ), row=1, col=1)
 
+                # Add Signals to the chart
                 for signal in signals:
                     signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
-                    if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
+                    # Only add signals if they fall within the displayed historical/prediction range
+                    if not df_prediction.empty and signal['date'] >= df_indicators_display.index.min():
                         fig.add_trace(go.Scatter(
                             x=[signal['date']],
                             y=[signal['price']],
@@ -884,6 +911,7 @@ with col2:
                             showlegend=False
                         ), row=1, col=1)
 
+                # RSI Plot (Row 2)
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['RSI'],
@@ -894,6 +922,7 @@ with col2:
                 fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought (70)", annotation_position="top right", annotation_font_color="red")
                 fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold (30)", annotation_position="bottom right", annotation_font_color="green")
 
+                # MACD Plot (Row 3)
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['MACD'],
@@ -1022,7 +1051,7 @@ with col3:
                     </div>
                     """, unsafe_allow_html=True)
 
-                    with st.expander(f"დეტალები: {signal['type']} {signal['date'].strftime('%Y-%m-%m %H:%M:%S')}"):
+                    with st.expander(f"დეტალები: {signal['type']} {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}"):
                         st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
