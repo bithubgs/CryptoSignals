@@ -3,10 +3,10 @@ pandas
 plotly
 requests
 # Pinning specific versions for compatibility
-numpy==1.24.4  # Or try 1.23.5 if 1.24.x still causes issues
+numpy==1.24.4
 scipy==1.10.1
 scikit-learn==1.2.2
 statsmodels==0.14.0
 prophet==1.1.1
-tensorflow==2.12.0 # Ensure this is compatible with your Python 3.12 (TensorFlow 2.12 supports up to Python 3.10 officially, but often works with 3.11/3.12 via wheels)
-pmdarima==2.0.4  # The latest stable version
+tensorflow==2.12.0
+pmdarima==2.0.4
