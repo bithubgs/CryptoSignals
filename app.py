@@ -8,7 +8,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sqlite3 # Import SQLite
 import os # For file operations
-import numpy as np # For numerical operations
 
 # Import forecasting models with checks
 try:
@@ -24,11 +23,13 @@ except ImportError:
     Prophet = None
 
 try:
+    import numpy as np
     from sklearn.preprocessing import MinMaxScaler
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
     # Suppress TensorFlow warnings
+    import os
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR') # Only show errors
@@ -45,8 +46,7 @@ st.set_page_config(layout="wide", page_title="კრიპტო სიგნა
 # --- Configuration ---
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 API_CALL_INTERVAL = 2.5 # Increased to be safer against 429 errors
-# Increased historical days for better model training
-MAX_HISTORICAL_DAYS = 1000 # Fetch approx 3 years of data for better MA99, RSI, MACD, and especially LSTM training
+MAX_HISTORICAL_DAYS = 365 # Fetch 1 year of data for MA99, RSI, MACD, and LSTM training
 
 COINGECKO_CRYPTO_MAP = {
     'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 'DOT': 'polkadot',
@@ -139,20 +139,14 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
 
     if db_data:
         # Check if we have enough data and if the latest date is today (or very recent)
-        # Using a small tolerance for "today" (e.g., within the last 24 hours from timestamp)
-        # The timestamp column can be useful here. For simplicity, check file date for now.
         latest_date_in_db = max([row[0] for row in db_data])
-        
-        # Check if the latest data point is from today. If not, consider it stale.
-        # This prevents constantly refetching if your 'days' value is less than the total data in DB
-        # We want to refresh if the latest data in DB is *not* today's data.
-        if datetime.datetime.strptime(latest_date_in_db, '%Y-%m-%d').date() == datetime.date.today() and len(db_data) >= days:
+        if len(db_data) >= days and latest_date_in_db == datetime.date.today().strftime('%Y-%m-%d'):
             st.toast(f"ისტორიული მონაცემები ჩაიტვირთა SQLite ქეშიდან: {coingecko_id}", icon="💾")
             historical_data = [{'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'), 'price': row[1], 'type': 'historical'} for row in db_data]
             conn.close()
             return historical_data
         else:
-            st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. ვცდილობ განახლებას API-დან: {coingecko_id}")
+            st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. განახლება API-დან: {coingecko_id}")
 
     # 2. If not in DB or outdated, fetch from API
     st.toast(f"მიმდინარეობს ისტორიული მონაცემების ჩატვირთვა API-დან: {coingecko_id}", icon="🌐")
@@ -207,94 +201,34 @@ class CryptoDataForecaster:
         self.historical_prices.set_index('date', inplace=True)
         self.historical_prices['price'] = self.historical_prices['price'].astype(float)
         
-        # Pre-calculate technical indicators and additional features for the full historical data
-        self.historical_with_features = self.calculate_features_and_indicators()
-
-    def calculate_features_and_indicators(self):
-        df_hist = self.historical_prices.copy()
-        
-        # Basic Price Features
-        df_hist['price_lag1'] = df_hist['price'].shift(1) # Price of previous day
-        df_hist['daily_return'] = df_hist['price'].pct_change() # Daily percentage change
-
-        # Moving Averages (already present, good)
-        df_hist['MA7'] = df_hist['price'].rolling(window=7, min_periods=1).mean()
-        df_hist['MA25'] = df_hist['price'].rolling(window=25, min_periods=1).mean()
-        df_hist['MA99'] = df_hist['price'].rolling(window=99, min_periods=1).mean()
-
-        # Relative Strength Index (RSI)
-        delta = df_hist['price'].diff()
-        gain = (delta.where(delta > 0, 0))
-        loss = (-delta.where(delta < 0, 0))
-        
-        avg_gain = gain.ewm(span=14, adjust=False, min_periods=14).mean()
-        avg_loss = loss.ewm(span=14, adjust=False, min_periods=14).mean()
-        
-        # Handle division by zero for rs
-        rs = avg_gain / avg_loss.replace(0, np.nan) 
-        df_hist['RSI'] = 100 - (100 / (1 + rs))
-        df_hist['RSI'].fillna(0, inplace=True) # Fill initial NaNs for RSI, if any
-        df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0) # Handle inf values
-
-        # Moving Average Convergence Divergence (MACD)
-        exp1 = df_hist['price'].ewm(span=12, adjust=False, min_periods=12).mean()
-        exp2 = df_hist['price'].ewm(span=26, adjust=False, min_periods=26).mean()
-        df_hist['MACD'] = exp1 - exp2
-        df_hist['Signal_Line'] = df_hist['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
-        df_hist['MACD_Histogram'] = df_hist['MACD'] - df_hist['Signal_Line']
-
-        # Time-based features (for seasonality and trends)
-        df_hist['day_of_week'] = df_hist.index.dayofweek # Monday=0, Sunday=6
-        df_hist['day_of_month'] = df_hist.index.day
-        df_hist['month'] = df_hist.index.month
-        df_hist['year'] = df_hist.index.year
-
-        # Drop rows with NaN values resulting from feature engineering
-        # This ensures clean data for models, especially LSTM
-        df_hist = df_hist.dropna()
-        
-        return df_hist
+        # Pre-calculate technical indicators for the full historical data
+        self.historical_with_indicators = self.calculate_technical_indicators()
 
     def _generate_lstm_predictions(self, days):
         if not LSTM_AVAILABLE:
             st.error("LSTM მოდელი არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ TensorFlow/Keras, NumPy და Scikit-learn.")
             return [] # Return empty if dependencies are missing
 
-        # Use all relevant features, not just a subset
-        features = ['price', 'MA7', 'MA25', 'RSI', 'MACD', 'daily_return', 'day_of_week', 'day_of_month', 'month', 'year']
+        df_lstm = self.historical_with_indicators[['price', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
         
-        # Ensure we have enough data after dropping NaNs
-        df_lstm = self.historical_with_features[features].copy()
-        
-        # Check if any feature column is entirely NaN after dropping rows - this shouldn't happen with dropna()
-        # but good to be defensive
-        if df_lstm.isnull().any().any():
-             st.warning("LSTM მონაცემებში დარჩა NaN მნიშვნელობები. პროგნოზი შეიძლება არასწორი იყოს.")
-             df_lstm = df_lstm.dropna() # Re-dropna just in case
-
-        if len(df_lstm) < 100: # Increased minimum data points for LSTM
-            st.warning(f"არასაკმარისი სუფთა მონაცემები LSTM პროგნოზისთვის (მინიმუმ 100 დღე, მიღებულია {len(df_lstm)}).")
+        if len(df_lstm) < 100:
+            st.warning(f"არასაკმარისი სუფთა მონაცემები (MA, RSI, MACD-ით) LSTM პროგნოზისთვის (მინიმუმ 100 დღე).")
             return []
 
-        look_back = 60 # Number of previous time steps to use as input features
-        n_features = df_lstm.shape[1] # Number of features used (price + indicators + time features)
+        look_back = 60
+        n_features = df_lstm.shape[1]
 
-        # Scale all features
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        data_scaled = scaler.fit_transform(df_lstm.values)
-        
-        # Keep a separate scaler for the 'price' column to inverse transform correctly
+        data_scaled = MinMaxScaler(feature_range=(0, 1)).fit_transform(df_lstm.values)
         scaler_price = MinMaxScaler(feature_range=(0, 1))
         scaler_price.fit(df_lstm['price'].values.reshape(-1, 1)) 
 
         X, y = [], []
         for i in range(len(data_scaled) - look_back):
             X.append(data_scaled[i:(i + look_back), :])
-            y.append(data_scaled[i + look_back, 0]) # Predict only the 'price' (first column)
+            y.append(data_scaled[i + look_back, 0])
         X = np.array(X)
         y = np.array(y)
 
-        # Build LSTM model
         model = Sequential()
         model.add(LSTM(units=100, return_sequences=True, input_shape=(look_back, n_features)))
         model.add(Dropout(0.3))
@@ -304,14 +238,12 @@ class CryptoDataForecaster:
         model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
 
         try:
-            # Increased epochs for potentially better learning, but be mindful of training time
-            model.fit(X, y, epochs=70, batch_size=32, verbose=0) 
+            model.fit(X, y, epochs=50, batch_size=32, verbose=0) 
         except Exception as e:
             st.error(f"შეცდომა LSTM მოდელის ტრენინგისას: {e}. პროგნოზი მიუწვდომელია.")
             return []
 
         prediction_list = []
-        # Use the very last 'look_back' data points from the scaled historical features for the first prediction
         current_input = data_scaled[-look_back:].reshape(1, look_back, n_features)
         last_date_original = self.historical_prices.index[-1]
 
@@ -322,24 +254,9 @@ class CryptoDataForecaster:
             date = last_date_original + datetime.timedelta(days=i+1)
             prediction_list.append({'date': date, 'price': max(0.00000001, round(predicted_price, 8)), 'type': 'prediction'})
             
-            # For the next prediction, update the 'current_input'
-            # We need to simulate the features for the predicted day to feed back into the model.
-            # This is a simplification and assumes future features (like MA, RSI) will follow a similar pattern.
-            # A more robust approach might involve predicting features as well or using more complex models.
-
-            # Create a dummy row for the next day's features, filled with NaNs initially
-            next_day_features = np.zeros((1, n_features))
-            next_day_features[0, 0] = predicted_scaled_price # Put predicted price in the first feature column
-            
-            # For simplicity, for other features, we can reuse the last known scaled features for now
-            # In a real-world scenario, you might have a more sophisticated way to estimate these future features.
-            # Here, we'll carry forward the last actual feature values for the non-price features.
-            last_actual_features = data_scaled[-1, :] # Last row of actual scaled features
-            for j in range(1, n_features): # Copy all features except the price
-                next_day_features[0, j] = last_actual_features[j] # This is a simplification!
-
-            # Update current_input by removing the oldest step and adding the new predicted step
-            current_input = np.append(current_input[:, 1:, :], next_day_features.reshape(1, 1, n_features), axis=1)
+            last_features_scaled = current_input[0, -1, :].copy()
+            last_features_scaled[0] = predicted_scaled_price
+            current_input = np.append(current_input[:, 1:, :], last_features_scaled.reshape(1, 1, n_features), axis=1)
 
         return prediction_list
 
@@ -360,9 +277,6 @@ class CryptoDataForecaster:
 
             series = self.historical_prices['price']
             try:
-                # Experiment with different ARIMA orders or use auto_arima if pmdarima is installed
-                # (p,d,q) parameters: p=AR order, d=differencing order, q=MA order
-                # (5,1,0) is a common starting point for daily data.
                 model = ARIMA(series, order=(5,1,0)) 
                 model_fit = model.fit()
                 forecast_result = model_fit.predict(start=len(series), end=len(series) + days - 1)
@@ -387,8 +301,7 @@ class CryptoDataForecaster:
             df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
 
             try:
-                # Increased changepoint_prior_scale for more flexibility in trend changes
-                model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, changepoint_prior_scale=0.15) 
+                model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, changepoint_prior_scale=0.1) 
                 model.fit(df_prophet)
                 future = model.make_future_dataframe(periods=days)
                 forecast = model.predict(future)
@@ -450,6 +363,33 @@ class CryptoDataForecaster:
                 })
         
         return sorted(signals, key=lambda x: x['date'])
+
+    def calculate_technical_indicators(self):
+        df_hist = self.historical_prices.copy()
+        
+        df_hist['MA7'] = df_hist['price'].rolling(window=7, min_periods=1).mean()
+        df_hist['MA25'] = df_hist['price'].rolling(window=25, min_periods=1).mean()
+        df_hist['MA99'] = df_hist['price'].rolling(window=99, min_periods=1).mean()
+
+        delta = df_hist['price'].diff()
+        gain = (delta.where(delta > 0, 0))
+        loss = (-delta.where(delta < 0, 0))
+        
+        avg_gain = gain.ewm(span=14, adjust=False, min_periods=14).mean()
+        avg_loss = loss.ewm(span=14, adjust=False, min_periods=14).mean()
+        
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        df_hist['RSI'] = 100 - (100 / (1 + rs))
+        df_hist['RSI'].fillna(0, inplace=True)
+        df_hist['RSI'] = df_hist['RSI'].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        exp1 = df_hist['price'].ewm(span=12, adjust=False, min_periods=12).mean()
+        exp2 = df_hist['price'].ewm(span=26, adjust=False, min_periods=26).mean()
+        df_hist['MACD'] = exp1 - exp2
+        df_hist['Signal_Line'] = df_hist['MACD'].ewm(span=9, adjust=False, min_periods=9).mean()
+        df_hist['MACD_Histogram'] = df_hist['MACD'] - df_hist['Signal_Line']
+        
+        return df_hist
 
 
 def format_price(price):
@@ -669,7 +609,7 @@ with col1: # Left Pane
                 st.rerun()
 
         st.markdown("<span>პოპულარული:</span>", unsafe_allow_html=True)
-        popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'SKL', 'SAND']
+        popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'SAND', 'SKL']
         cols_pop = st.columns(len(popular_cryptos))
         for i, crypto_tag in enumerate(popular_cryptos):
             with cols_pop[i]:
@@ -777,7 +717,7 @@ with col2: # Center Pane (Chart Section)
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
 
                 # Filter historical data for display based on current_period AFTER indicator calculation
-                df_indicators_display = forecaster.historical_with_features.tail(st.session_state.current_period).copy() # Use historical_with_features here
+                df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.current_period).copy()
                 
                 # --- Create Plotly Subplots ---
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
@@ -835,7 +775,6 @@ with col2: # Center Pane (Chart Section)
                 # Add Signals as Scatter points with text labels on Row 1
                 for signal in signals:
                     signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
-                    # Only plot signals that fall within the displayed date range (current_period)
                     if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
                         fig.add_trace(go.Scatter(
                             x=[signal['date']],
@@ -947,18 +886,7 @@ with col2: # Center Pane (Chart Section)
                     <p><span class='modal-label'>მოძრავი საშუალო (MA):</span> მოძრავი საშუალო (Moving Average) აჩვენებს ფასის საშუალო მნიშვნელობას განსაზღვრულ პერიოდში (მაგ., 7, 25, 99 დღე). ის გამოიყენება ტრენდის იდენტიფიცირებისთვის და ფასის "ხმაურის" გასაგლუვებლად. მოკლევადიანი MA-ს გრძელვადიან MA-ზე ზემოთ კვეთა (ე.წ. Golden Cross) განიხილება აღმავალი ტრენდის სიგნალად, ხოლო ქვემოთ კვეთა (Death Cross) - დაღმავალი ტრენდის სიგნალად.</p>
                     <p><span class='modal-label'>Relative Strength Index (RSI):</span> RSI არის იმპულსის ოსცილატორი, რომელიც ზომავს ფასის ცვლილებების სიჩქარესა და ცვლილებას. ის მერყეობს 0-დან 100-მდე. 70-ზე ზემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Overbought) და შესაძლოა ფასის კორექცია მოხდეს. 30-ზე ქვემოთ ნიშნავს, რომ აქტივი ზედმეტად გაყიდულია (Oversold) და შესაძლოა ფასის ზრდა დაიწყოს.</p>
                     <p><span class='modal-label'>Moving Average Convergence Divergence (MACD):</span> MACD არის ტრენდის მიმდევარი იმპულსის ინდიკატორი, რომელიც აჩვენებს ფასის ორ ექსპონენციალურ მოძრავ საშუალოს (EMA) შორის ურთიერთობას (ჩვეულებრივ, 12-დღიანი და 26-დღიანი EMA). MACD ხაზის სასიგნალო ხაზის (9-დღიანი MACD-ის EMA) ზემოთ კვეთა არის ყიდვის სიგნალი, ხოლო ქვემოთ კვეთა - გაყიდვის სიგნალი. MACD ჰისტოგრამა აჩვენებს MACD ხაზსა და სასიგნალო ხაზს შორის განსხვავებას და გამოიყენება იმპულსის სიმძლავრის გასაზომად.</p>
-                    <p><span class='modal-label'>LSTM (Long Short-Term Memory):</span> LSTM არის ხელოვნური ნერონული ქსელის სპეციალური ტიპი, რომელიც განსაკუთრებით ეფექტურია დროითი სერიების მონაცემების დასამუშავებლად და პროგნოზირებისთვის. მას შეუძლია ისწავლოს დამოკიდებულებები მონაცემებში როგორც მოკლე, ასევე გრძელვადიან პერსპექტივაში, რაც მას სასარგებლოს ხდის კომპლექსური ფინანსური მონაცემების მოდელირებისთვის.</p>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Add a disclaimer for users
-                st.markdown("---")
-                st.markdown("<h3><i class='fas fa-exclamation-triangle'></i> მნიშვნელოვანი გაფრთხილება:</h3>", unsafe_allow_html=True)
-                st.markdown("""
-                <div class="argumentation-box">
-                    <p>გთხოვთ, გაითვალისწინოთ, რომ კრიპტოვალუტების ფასების პროგნოზირება ძალიან რთული და არაზუსტი ამოცანაა. ეს AI მოდელები ეყრდნობა მხოლოდ ისტორიულ ფასებსა და ტექნიკურ ინდიკატორებს და ვერ ითვალისწინებს გარე ფაქტორებს, როგორიცაა სიახლეები, რეგულაციები, საბაზრო განწყობა ან მოულოდნელი მოვლენები.</p>
-                    <p>პროგნოზები უნდა იქნას გამოყენებული მხოლოდ საინფორმაციო მიზნებისთვის და არა როგორც საინვესტიციო რჩევა. ყოველთვის ჩაატარეთ საკუთარი კვლევა და ივაჭრეთ სიფრთხილით.</p>
-                    <p>მოდელის სიზუსტე დამოკიდებულია მონაცემთა ხარისხზე, რაოდენობაზე და ბაზრის ცვალებადობაზე. მაღალი ცვალებადობის მქონე აქტივებისთვის პროგნოზები, როგორც წესი, ნაკლებად ზუსტია.</p>
+                    <p><span class='modal-label'>LSTM (Long Short-Term Memory):</span> LSTM არის ხელოვნური ნერონული ქსელის სპეციალური ტიპი, რომელიც განსაკუთრებით ეფექტურია დროითი სერიების მონაცემების დასამუშავებლად და პროგნოზირებისთვის. მას შეუძლია ისწავლოს დამოკიდებულებები მონაცემებში როგორც მოკლე, ასევე გრძელვადიან პერსპექტივაში, რაც მას სასარგებლოს ხდის კომპლექსური ფინანსური მონაცემების მოდელირებისთვის.
                 </div>
                 """, unsafe_allow_html=True)
 
