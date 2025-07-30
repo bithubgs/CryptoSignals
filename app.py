@@ -6,15 +6,28 @@ import time
 from functools import lru_cache
 import pandas as pd
 import plotly.graph_objects as go
-from statsmodels.tsa.arima.model import ARIMA # You would need to install statsmodels
+from statsmodels.tsa.arima.model import ARIMA # <--- ეს იმპორტი დაგჭირდება თუ ARIMA-ს გამოიყენებ
+# from prophet import Prophet # <--- ეს იმპორტი დაგჭირდება თუ Prophet-ს გამოიყენებ
 
-# (Keep existing imports and configurations)
+# --- Set page config for wide mode ---
+st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
+
+# --- Configuration ---
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+API_CALL_INTERVAL = 1.2 # Coingecko allows 100 calls/minute, so ~1.2 seconds per call
+
+COINGECKO_CRYPTO_MAP = {
+    'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 'DOT': 'polkadot',
+    'LINK': 'chainlink', 'MATIC': 'polygon', 'AVAX': 'avalanche-2', 'ATOM': 'cosmos', 'LTC': 'litecoin',
+    'BCH': 'bitcoin-cash', 'XRP': 'ripple', 'DOGE': 'dogecoin', 'SHIB': 'shiba-inu', 'UNI': 'uniswap',
+    'AAVE': 'aave', 'SAND': 'the-sandbox', 'MANA': 'decentraland', 'AXS': 'axie-infinity', 'SKL': 'skale'
+}
 
 # --- Helper Functions (adapted from app.py) ---
 def rate_limit_api_call():
     if 'last_api_call' not in st.session_state:
         st.session_state.last_api_call = 0
-    
+
     elapsed = time.time() - st.session_state.last_api_call
     if elapsed < API_CALL_INTERVAL:
         time.sleep(API_CALL_INTERVAL - elapsed)
@@ -72,11 +85,11 @@ class CryptoDataForecaster: # Renamed from Simulator
         # Convert date to datetime if not already
         self.historical_prices['date'] = pd.to_datetime(self.historical_prices['date'])
         self.historical_prices.set_index('date', inplace=True)
-        
+
         # --- Simplified Forecasting (Conceptual, for demonstration) ---
         # For a real application, you'd use a robust model like ARIMA, Prophet, or an LSTM.
         # This is a basic moving average extrapolation, which is more stable than random walk.
-        
+
         # Ensure prices are float
         self.historical_prices['price'] = self.historical_prices['price'].astype(float)
 
@@ -101,7 +114,7 @@ class CryptoDataForecaster: # Renamed from Simulator
         # Simple trend based on MA crossover and a dampened random walk
         for i in range(1, days + 1):
             date = last_date + datetime.timedelta(days=i)
-            
+
             # Simple trend adjustment based on recent MA
             if last_short_ma > last_long_ma: # Upward trend
                 trend_factor = random.uniform(1.001, 1.005) # Small positive drift
@@ -110,12 +123,12 @@ class CryptoDataForecaster: # Renamed from Simulator
 
             # Add a smaller, more controlled random fluctuation
             random_fluctuation = random.uniform(0.995, 1.005) 
-            
+
             current_predicted_price *= trend_factor * random_fluctuation
             current_predicted_price = max(0.00000001, current_predicted_price) # Ensure price doesn't go negative
-            
+
             prediction_data.append({'date': date, 'price': round(current_predicted_price, 8), 'type': 'prediction'})
-            
+
             # Update last_short_ma, last_long_ma conceptually for next step (in a real model, this would be part of the forecast)
             # For this simple example, we're just carrying forward the last trend, a more complex model would recalculate.
 
@@ -124,7 +137,7 @@ class CryptoDataForecaster: # Renamed from Simulator
     def generate_signals_from_prediction(self, prediction_data):
         if len(prediction_data) < 5: # Need more data for MA-based signals
             return []
-        
+
         df_prediction = pd.DataFrame(prediction_data)
         df_prediction['date'] = pd.to_datetime(df_prediction['date'])
         df_prediction.set_index('date', inplace=True)
@@ -164,7 +177,7 @@ class CryptoDataForecaster: # Renamed from Simulator
                     'confidence': f"{random.randint(65, 85)}%",
                     'argumentation': f"AI პროგნოზირებს მოკლევადიანი მოძრავი საშუალოს (MA{short_window}) გრძელვადიან მოძრავ საშუალოზე (MA{long_window}) ქვემოთ კვეთას, რაც პოტენციური დაღმავალი ტრენდის დასაწყისს მიანიშნებს."
                 })
-        
+
         return sorted(signals, key=lambda x: x['date'])
 
 
@@ -183,7 +196,7 @@ def format_currency(value):
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
-    
+
     :root {
         --bg-dark: #0a0a0a;
         --bg-medium: #1a1a1a;
@@ -198,7 +211,7 @@ st.markdown("""
         --card-bg: #1c1c1c;
         --border-color: #333;
     }
-    
+
     /* Apply font and background to the Streamlit app */
     .stApp {
         font-family: 'Inter', sans-serif;
@@ -206,16 +219,16 @@ st.markdown("""
         color: var(--text-light);
         padding: 1rem; /* Adjust padding if needed */
     }
-    
+
     h1 {
         font-size: 2.5rem;
         font-weight: 800;
         text-shadow: 0 0 10px var(--accent-blue), 0 0 20px var(--accent-purple);
         color: var(--text-light); /* Ensure H1 color */
     }
-    
+
     .live-text { color: var(--accent-red); /* No animation support here */ }
-    
+
     .stSelectbox, .stTextInput, .stButton > button {
         background-color: var(--bg-dark);
         color: var(--text-light);
@@ -333,7 +346,7 @@ st.markdown("""
     .status-indicator.connected i {
         color: var(--accent-green);
     }
-    
+
     /* Minor adjustments for responsiveness in Streamlit context */
     @media (max-width: 768px) {
         .stApp { padding: 0.5rem; }
@@ -369,7 +382,7 @@ col1, col2, col3 = st.columns([0.8, 1.5, 0.8]) # Adjust ratios as needed
 with col1: # Left Pane
     with st.container(border=False): # Use container to mimic card styling
         st.markdown("<h3>აირჩიეთ კრიპტოვალუტა:</h3>", unsafe_allow_html=True)
-        
+
         # Use a form to group input and button to prevent immediate rerun on text change
         with st.form("symbol_form"):
             symbol_input = st.text_input("შეიყვანეთ სიმბოლო (მაგ. BTC, ETH)", st.session_state.current_symbol).upper().strip()
@@ -397,14 +410,14 @@ with col1: # Left Pane
 
         # Fetch data on initial load or symbol change
         coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
-        
+
         if coingecko_id:
             with st.spinner(f"იტვირთება მონაცემები {st.session_state.current_symbol}-ისთვის..."):
                 coin_details = fetch_coin_details(coingecko_id)
                 if coin_details:
                     st.markdown(f"<h2 id='coin-name'>{coin_details['name']} ({coin_details['symbol']})</h2>", unsafe_allow_html=True)
                     st.markdown(f"<p id='current-price' class='price-value'>{format_price(coin_details['currentPrice'])} $</p>", unsafe_allow_html=True)
-                    
+
                     # Market Stats Grid using Streamlit columns
                     col_m1, col_m2 = st.columns(2)
                     with col_m1:
@@ -414,7 +427,7 @@ with col1: # Left Pane
                     with col_m2:
                         st.markdown("<div class='stat-card'><h4>24სთ მოცულობა</h4>", unsafe_allow_html=True)
                         st.markdown(f"<div class='value'>{format_currency(coin_details['24hVolume'])}</div></div>", unsafe_allow_html=True)
-                    
+
                     col_m3, col_m4 = st.columns(2)
                     with col_m3:
                         st.markdown("<div class='stat-card'><h4>კაპიტალიზაცია</h4>", unsafe_allow_html=True)
@@ -439,7 +452,7 @@ with col1: # Left Pane
 with col2: # Center Pane (Chart Section)
     with st.container(border=False): # Use container to mimic card styling
         st.markdown(f"<div class='chart-header'><h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3></div>", unsafe_allow_html=True)
-        
+
         # Time Filters
         st.markdown("<div class='chart-controls'>", unsafe_allow_html=True)
         filter_cols = st.columns(3)
@@ -457,7 +470,7 @@ with col2: # Center Pane (Chart Section)
             historical_data_list = fetch_historical_data_coingecko(coingecko_id, days=st.session_state.current_period)
             if historical_data_list:
                 df_historical = pd.DataFrame(historical_data_list)
-                
+
                 # Generate predictions using the new forecaster
                 forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
                 prediction_data_list = forecaster.generate_predictions()
@@ -465,7 +478,7 @@ with col2: # Center Pane (Chart Section)
 
                 # Prepare data for Plotly
                 df_prediction = pd.DataFrame(prediction_data_list)
-                
+
                 # Convert 'date' columns to datetime objects
                 df_historical['date'] = pd.to_datetime(df_historical['date'])
                 df_prediction['date'] = pd.to_datetime(df_prediction['date'])
@@ -547,7 +560,7 @@ with col2: # Center Pane (Chart Section)
                 )
 
                 st.plotly_chart(fig, use_container_width=True)
-                
+
                 st.markdown("""
                 <div class="chart-legend">
                     <div class="legend-item"><div class="legend-color historical"></div><span>ისტორია</span></div>
@@ -565,13 +578,13 @@ with col2: # Center Pane (Chart Section)
 with col3: # Right Pane (Signals Section)
     with st.container(border=False): # Use container to mimic card styling
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
-        
+
         if coingecko_id and coin_details and historical_data_list:
             df_historical = pd.DataFrame(historical_data_list) # Re-create DataFrame for consistency
             forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
             prediction_data_list = forecaster.generate_predictions()
             signals = forecaster.generate_signals_from_prediction(prediction_data_list)
-            
+
             if signals:
                 st.markdown("<div id='signals-list' class='signals-list'>", unsafe_allow_html=True)
                 for signal in signals:
@@ -593,7 +606,7 @@ with col3: # Right Pane (Signals Section)
                         st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
                         st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
-                        st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4>", unsafe_allow_html=True)
+                        st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4>\", unsafe_allow_html=True)
                         st.markdown(f"<p>{signal['argumentation']}</p></div>", unsafe_allow_html=True)
 
                 st.markdown("</div>", unsafe_allow_html=True)
