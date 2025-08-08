@@ -9,14 +9,27 @@ from plotly.subplots import make_subplots
 import sqlite3
 import os
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-# Suppress TensorFlow warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR') # Only show errors
+
+# --- Import forecasting models with checks ---
+try:
+    from prophet import Prophet
+except ImportError:
+    st.error("Prophet მოდული ვერ მოიძებნა. დააინსტალირეთ 'prophet': pip install prophet")
+    Prophet = None
+
+try:
+    from sklearn.preprocessing import MinMaxScaler
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    # Suppress TensorFlow warnings
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR') # Only show errors
+    LSTM_AVAILABLE = True
+except ImportError:
+    st.error("TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy")
+    LSTM_AVAILABLE = False
 
 # --- Set page config for wide mode ---
 st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
@@ -41,9 +54,6 @@ def init_db():
     """Initializes the SQLite database and creates the table if it doesn't exist."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Drop the table to ensure a clean state and prevent schema mismatch errors
-    # NOTE: Comment this line out if you want to keep data persistently across runs
-    cursor.execute('DROP TABLE IF EXISTS historical_prices')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS historical_prices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +125,6 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
     
     db_data = cursor.fetchall()
     
-    # Check if cache is outdated or incomplete
     should_update = True
     if db_data:
         latest_date_in_db = max([row[0] for row in db_data])
@@ -130,7 +139,7 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
         try:
             rate_limit_api_call()
             url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/ohlc"
-            params = {'vs_currency': 'usd', 'days': str(days)} # OHLC endpoint
+            params = {'vs_currency': 'usd', 'days': str(MAX_HISTORICAL_DAYS)} # Always fetch max days
             response = requests.get(url, params=params, timeout=15)
             response.raise_for_status()
             api_data = response.json()
@@ -147,7 +156,6 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
                     'type': 'historical'
                 })
             
-            # Save/Update to SQLite
             for entry in fetched_historical_data:
                 cursor.execute('''
                     INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price_open, price_high, price_low, price_close)
@@ -158,7 +166,11 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
             st.toast(f"ისტორიული მონაცემები შენახულია/განახლებულია SQLite-ში: {coingecko_id}", icon="💾")
             
             conn.close()
-            return fetched_historical_data
+            # Filter fetched data by the requested 'days'
+            df_full = pd.DataFrame(fetched_historical_data)
+            df_full['date'] = pd.to_datetime(df_full['date'])
+            df_full.set_index('date', inplace=True)
+            return df_full.tail(days).reset_index().to_dict('records')
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
@@ -187,19 +199,12 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
 
 
 def calculate_support_resistance(df, window=20):
-    """
-    Calculates support and breakout levels.
-    Support is defined as a significant low, Breakout as a significant high.
-    We'll use rolling window to find these levels.
-    """
     if len(df) < window:
         return None, None
     
-    # Calculate rolling min and max
     df['rolling_min'] = df['low'].rolling(window=window).min()
     df['rolling_max'] = df['high'].rolling(window=window).max()
     
-    # Simple logic: Support is the last significant low, Breakout is the last significant high
     support_level = df['rolling_min'].iloc[-1]
     resistance_level = df['rolling_max'].iloc[-1]
     
@@ -216,6 +221,9 @@ class CryptoDataForecaster:
         self.historical_with_indicators = self.calculate_technical_indicators()
 
     def _generate_lstm_predictions(self, days):
+        if not LSTM_AVAILABLE:
+            return []
+
         df_lstm = self.historical_with_indicators[['close', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
         
         if len(df_lstm) < 100:
@@ -267,12 +275,39 @@ class CryptoDataForecaster:
 
         return prediction_list
 
-    def generate_predictions(self, days=PREDICTION_DAYS):
+    def _generate_prophet_predictions(self, days):
+        if not Prophet:
+            return []
+
+        df_prophet = self.historical_prices[['close']].reset_index()
+        df_prophet.columns = ['ds', 'y']
+        
+        model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False,
+                        changepoint_prior_scale=0.1, seasonality_prior_scale=10.0)
+        try:
+            model.fit(df_prophet)
+            future = model.make_future_dataframe(periods=days)
+            forecast = model.predict(future)
+            prediction_list = forecast[['ds', 'yhat']].tail(days).rename(columns={'ds': 'date', 'yhat': 'close'}).to_dict('records')
+            for item in prediction_list:
+                item['type'] = 'prediction'
+            return prediction_list
+        except Exception as e:
+            st.error(f"შეცდომა Prophet მოდელით პროგნოზირებისას: {e}")
+            return []
+
+
+    def generate_predictions(self, model_choice, days=PREDICTION_DAYS):
         if self.historical_prices.empty:
             st.warning("ისტორიული მონაცემები არ არის პროგნოზირებისთვის.")
             return []
         
-        return self._generate_lstm_predictions(days)
+        if model_choice == "Prophet Model":
+            return self._generate_prophet_predictions(days)
+        elif model_choice == "LSTM Model":
+            return self._generate_lstm_predictions(days)
+        
+        return []
 
     def generate_signals_from_prediction(self, prediction_data):
         if len(prediction_data) < 7:
@@ -528,6 +563,8 @@ st.markdown("""
 
 if 'current_symbol' not in st.session_state:
     st.session_state.current_symbol = 'SAND'
+if 'selected_period' not in st.session_state:
+    st.session_state.selected_period = 365
 
 col1, col2, col3 = st.columns([0.8, 1.5, 0.8])
 
@@ -553,7 +590,36 @@ with col1:
                     st.session_state.current_symbol = crypto_tag
                     st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
                     st.rerun()
+    st.markdown("---")
 
+    with st.container(border=False):
+        st.markdown("<h3>პარამეტრები</h3>", unsafe_allow_html=True)
+        
+        st.markdown("<h4>აირჩიეთ პროგნოზირების მოდელი:</h4>", unsafe_allow_html=True)
+        model_options = ["LSTM Model", "Prophet Model"]
+        if not LSTM_AVAILABLE:
+            model_options.remove("LSTM Model")
+        
+        model_choice = st.selectbox(
+            "პროგნოზირების მოდელი",
+            options=model_options,
+            index=0, # Default to LSTM Model
+            key='model_choice_box',
+            label_visibility='collapsed'
+        )
+
+        st.markdown("<h4>აირჩიეთ ისტორიული მონაცემების პერიოდი:</h4>", unsafe_allow_html=True)
+        periods = [30, 90, 365]
+        cols_period = st.columns(len(periods))
+        
+        for i, period in enumerate(periods):
+            with cols_period[i]:
+                if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True):
+                    st.session_state.selected_period = period
+                    st.rerun()
+
+        if model_choice == "LSTM Model" and st.session_state.selected_period < 100:
+            st.warning("LSTM მოდელი მოითხოვს მინიმუმ 100 დღის მონაცემს. გირჩევთ აირჩიოთ '365 დღე'.")
     st.markdown("---")
 
     with st.container(border=False):
@@ -602,22 +668,21 @@ with col2:
     with st.container(border=False):
         st.markdown(f"<div class='chart-header'><h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3></div>", unsafe_allow_html=True)
         
-        st.markdown("<span><i class='fas fa-chart-line'></i> მონაცემები ნაჩვენებია მაქსიმალური პერიოდისთვის (365 დღე), რაც ოპტიმალურია LSTM პროგნოზისთვის.</span>", unsafe_allow_html=True)
-
+        coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
         if coingecko_id and coin_details:
-            historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
+            historical_data_list = fetch_historical_data_sqlite(coingecko_id, days=st.session_state.selected_period)
             
-            if historical_data_list_full:
-                df_historical_full = pd.DataFrame(historical_data_list_full)
-                df_historical_full['date'] = pd.to_datetime(df_historical_full['date'])
+            if historical_data_list:
+                df_historical = pd.DataFrame(historical_data_list)
+                df_historical['date'] = pd.to_datetime(df_historical['date'])
                 
-                forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical_full)
+                forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
                 
-                with st.spinner(f"მიმდინარეობს LSTM მოდელით პროგნოზირება..."):
-                    prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS)
+                with st.spinner(f"მიმდინარეობს {model_choice} მოდელით პროგნოზირება..."):
+                    prediction_data_list = forecaster.generate_predictions(model_choice=model_choice, days=PREDICTION_DAYS)
                 
                 if not prediction_data_list:
-                    st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა LSTM Model მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
+                    st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა {model_choice} მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
                 
                 df_prediction = pd.DataFrame(prediction_data_list)
                 if not df_prediction.empty:
@@ -625,13 +690,10 @@ with col2:
                 
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
                 
-                # We always use MAX_HISTORICAL_DAYS now
-                df_indicators_display = forecaster.historical_with_indicators.tail(MAX_HISTORICAL_DAYS).copy()
+                df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.selected_period).copy()
 
-                # Calculate Support & Resistance
-                support_level, resistance_level = calculate_support_resistance(df_historical_full.tail(MAX_HISTORICAL_DAYS))
+                support_level, resistance_level = calculate_support_resistance(df_historical.tail(st.session_state.selected_period))
 
-                # --- Create Plotly Subplots ---
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
                                     vertical_spacing=0.08, 
                                     row_heights=[0.6, 0.2, 0.2],
@@ -641,8 +703,6 @@ with col2:
                                         "Moving Average Convergence Divergence (MACD)"
                                     ))
 
-                # --- Row 1: Candlestick, MAs, Prediction ---
-                # Historical Price (Candlestick)
                 fig.add_trace(go.Candlestick(
                     x=df_indicators_display.index,
                     open=df_indicators_display['open'],
@@ -653,7 +713,6 @@ with col2:
                     showlegend=False
                 ), row=1, col=1)
 
-                # Prediction Data (Line)
                 if not df_prediction.empty:
                     fig.add_trace(go.Scatter(
                         x=df_prediction['date'],
@@ -663,7 +722,6 @@ with col2:
                         line=dict(color='#8e2de2', dash='dot', width=2)
                     ), row=1, col=1)
 
-                # Moving Averages on Historical Data
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['MA7'],
@@ -686,13 +744,11 @@ with col2:
                     line=dict(color='lightgreen', width=1, dash='solid')
                 ), row=1, col=1)
 
-                # Support and Resistance Levels
                 if support_level:
                     fig.add_hline(y=support_level, line_dash="solid", line_color="#00a3e0", opacity=0.8, annotation_text=f"Support: {format_price(support_level)} $", annotation_position="bottom right", row=1, col=1)
                 if resistance_level:
                     fig.add_hline(y=resistance_level, line_dash="solid", line_color="#ff5733", opacity=0.8, annotation_text=f"Breakout: {format_price(resistance_level)} $", annotation_position="top right", row=1, col=1)
 
-                # Add Signals as Scatter points
                 for signal in signals:
                     signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
                     if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
@@ -719,7 +775,6 @@ with col2:
                             showlegend=False
                         ), row=1, col=1)
 
-                # --- Row 2: RSI ---
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['RSI'],
@@ -730,7 +785,6 @@ with col2:
                 fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought (70)", annotation_position="top right", annotation_font_color="red")
                 fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold (30)", annotation_position="bottom right", annotation_font_color="green")
 
-                # --- Row 3: MACD ---
                 fig.add_trace(go.Scatter(
                     x=df_indicators_display.index,
                     y=df_indicators_display['MACD'],
@@ -755,7 +809,6 @@ with col2:
                 fig.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
 
 
-                # --- Update Layout ---
                 fig.update_layout(
                     height=700,
                     xaxis_rangeslider_visible=False,
@@ -821,13 +874,14 @@ with col3:
     with st.container(border=False):
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
         
+        coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
         if coingecko_id and coin_details:
-            historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
+            historical_data_list = fetch_historical_data_sqlite(coingecko_id, days=st.session_state.selected_period)
             
-            forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list_full))
+            forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list))
             
-            with st.spinner(f"გენერირდება სიგნალები LSTM მოდელიდან..."):
-                prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS)
+            with st.spinner(f"გენერირდება სიგნალები {model_choice} მოდელიდან..."):
+                prediction_data_list = forecaster.generate_predictions(model_choice=model_choice, days=PREDICTION_DAYS)
             signals = forecaster.generate_signals_from_prediction(prediction_data_list)
             
             if signals:
