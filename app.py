@@ -452,14 +452,6 @@ st.markdown("""
         margin-bottom: 1.5rem;
     }
 
-    .stContainer > div > div > div > .stContainer {
-        background-color: transparent;
-        border: none;
-        box-shadow: none;
-        padding: 0;
-        margin-bottom: 0;
-    }
-
     .stAlert {
         border-radius: 10px;
         box-shadow: 0 5px 15px rgba(0, 0, 0, 0.4);
@@ -552,6 +544,64 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# --- Sidebar ---
+st.sidebar.title("პარამეტრები")
+
+if 'current_symbol' not in st.session_state:
+    st.session_state.current_symbol = 'SAND'
+if 'selected_period' not in st.session_state:
+    st.session_state.selected_period = 365
+
+with st.sidebar:
+    st.markdown("<h3>აირჩიეთ კრიპტოვალუტა:</h3>", unsafe_allow_html=True)
+    with st.form("symbol_form"):
+        symbol_input = st.text_input("შეიყვანეთ სიმბოლო (მაგ. BTC, ETH)", st.session_state.current_symbol).upper().strip()
+        submit_button = st.form_submit_button("ძიება", use_container_width=True)
+
+        if submit_button:
+            st.session_state.current_symbol = symbol_input
+            st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
+            st.rerun()
+
+    st.markdown("<span>პოპულარული:</span>", unsafe_allow_html=True)
+    popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'SAND', 'SKL']
+    cols_pop = st.columns(len(popular_cryptos))
+    for i, crypto_tag in enumerate(popular_cryptos):
+        with cols_pop[i]:
+            if st.button(crypto_tag, key=f"tag_{crypto_tag}", use_container_width=True):
+                st.session_state.current_symbol = crypto_tag
+                st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
+                st.rerun()
+    st.markdown("---")
+
+    st.markdown("<h3>პროგნოზირების მოდელი</h3>", unsafe_allow_html=True)
+    model_options = ["LSTM Model", "Prophet Model"]
+    if not LSTM_AVAILABLE:
+        model_options.remove("LSTM Model")
+    
+    model_choice = st.selectbox(
+        "პროგნოზირების მოდელი",
+        options=model_options,
+        index=0 if "LSTM Model" in model_options else 0, # Default to LSTM
+        key='model_choice_box',
+        label_visibility='collapsed'
+    )
+
+    st.markdown("<h3>ისტორიული მონაცემების პერიოდი</h3>", unsafe_allow_html=True)
+    periods = [30, 90, 365]
+    cols_period = st.columns(len(periods))
+    
+    for i, period in enumerate(periods):
+        with cols_period[i]:
+            if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True):
+                st.session_state.selected_period = period
+                st.rerun()
+
+    if model_choice == "LSTM Model" and st.session_state.selected_period < 100:
+        st.warning("LSTM მოდელი მოითხოვს მინიმუმ 100 დღის მონაცემს. გირჩევთ აირჩიოთ '365 დღე'.")
+
+# --- Main App Content ---
+
 st.title("კრიპტო სიგნალები LIVE")
 
 st.markdown("""
@@ -561,357 +611,157 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if 'current_symbol' not in st.session_state:
-    st.session_state.current_symbol = 'SAND'
-if 'selected_period' not in st.session_state:
-    st.session_state.selected_period = 365
+coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
+coin_details = None
+if coingecko_id:
+    with st.spinner(f"იტვირთება მონაცემები {st.session_state.current_symbol}-ისთვის..."):
+        coin_details = fetch_coin_details(coingecko_id)
 
-col1, col2, col3 = st.columns([0.8, 1.5, 0.8])
-
-with col1:
-    with st.container(border=False):
-        st.markdown("<h3>აირჩიეთ კრიპტოვალუტა:</h3>", unsafe_allow_html=True)
-        
-        with st.form("symbol_form"):
-            symbol_input = st.text_input("შეიყვანეთ სიმბოლო (მაგ. BTC, ETH)", st.session_state.current_symbol).upper().strip()
-            submit_button = st.form_submit_button("ძიება", use_container_width=True)
-
-            if submit_button:
-                st.session_state.current_symbol = symbol_input
-                st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
-                st.rerun()
-
-        st.markdown("<span>პოპულარული:</span>", unsafe_allow_html=True)
-        popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'SAND', 'SKL']
-        cols_pop = st.columns(len(popular_cryptos))
-        for i, crypto_tag in enumerate(popular_cryptos):
-            with cols_pop[i]:
-                if st.button(crypto_tag, key=f"tag_{crypto_tag}", use_container_width=True):
-                    st.session_state.current_symbol = crypto_tag
-                    st.toast(f"Fetching data for {st.session_state.current_symbol}...", icon="🔄")
-                    st.rerun()
-    st.markdown("---")
-
-    with st.container(border=False):
-        st.markdown("<h3>პარამეტრები</h3>", unsafe_allow_html=True)
-        
-        st.markdown("<h4>აირჩიეთ პროგნოზირების მოდელი:</h4>", unsafe_allow_html=True)
-        model_options = ["LSTM Model", "Prophet Model"]
-        if not LSTM_AVAILABLE:
-            model_options.remove("LSTM Model")
-        
-        model_choice = st.selectbox(
-            "პროგნოზირების მოდელი",
-            options=model_options,
-            index=0, # Default to LSTM Model
-            key='model_choice_box',
-            label_visibility='collapsed'
-        )
-
-        st.markdown("<h4>აირჩიეთ ისტორიული მონაცემების პერიოდი:</h4>", unsafe_allow_html=True)
-        periods = [30, 90, 365]
-        cols_period = st.columns(len(periods))
-        
-        for i, period in enumerate(periods):
-            with cols_period[i]:
-                if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True):
-                    st.session_state.selected_period = period
-                    st.rerun()
-
-        if model_choice == "LSTM Model" and st.session_state.selected_period < 100:
-            st.warning("LSTM მოდელი მოითხოვს მინიმუმ 100 დღის მონაცემს. გირჩევთ აირჩიოთ '365 დღე'.")
-    st.markdown("---")
-
+if coingecko_id and coin_details:
     with st.container(border=False):
         st.markdown("<div class='price-info-header'><h2>კრიპტოვალუტის ინფორმაცია</h2></div>", unsafe_allow_html=True)
-
-        coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
+        col_name, col_price = st.columns([1, 2])
+        with col_name:
+            st.markdown(f"<h2 id='coin-name'>{coin_details['name']} ({coin_details['symbol']})</h2>", unsafe_allow_html=True)
+        with col_price:
+            st.markdown(f"<p id='current-price' class='price-value'>{format_price(coin_details['currentPrice'])} $</p>", unsafe_allow_html=True)
         
-        if coingecko_id:
-            with st.spinner(f"იტვირთება მონაცემები {st.session_state.current_symbol}-ისთვის..."):
-                coin_details = fetch_coin_details(coingecko_id)
-                if coin_details:
-                    st.markdown(f"<h2 id='coin-name'>{coin_details['name']} ({coin_details['symbol']})</h2>", unsafe_allow_html=True)
-                    st.markdown(f"<p id='current-price' class='price-value'>{format_price(coin_details['currentPrice'])} $</p>", unsafe_allow_html=True)
-                    
-                    col_m1, col_m2 = st.columns(2)
-                    with col_m1:
-                        st.markdown("<h4>24სთ ცვლილება</h4>", unsafe_allow_html=True)
-                        daily_change_class = 'positive' if (coin_details['dailyChange'] or 0) >= 0 else 'negative'
-                        st.markdown(f"<p class='value {daily_change_class}'>{coin_details['dailyChange']:.2f}%</p>", unsafe_allow_html=True)
-                    with col_m2:
-                        st.markdown("<h4>24სთ მოცულობა</h4>", unsafe_allow_html=True)
-                        st.markdown(f"<p class='value'>{format_currency(coin_details['24hVolume'])}</p>", unsafe_allow_html=True)
-                    
-                    col_m3, col_m4 = st.columns(2)
-                    with col_m3:
-                        st.markdown("<h4>კაპიტალიზაცია</h4>", unsafe_allow_html=True)
-                        st.markdown(f"<p class='value'>{format_currency(coin_details['marketCap'])}</p>", unsafe_allow_html=True)
-                    with col_m4:
-                        st.markdown("<h4>რანგი</h4>", unsafe_allow_html=True)
-                        st.markdown(f"<p class='value'>#{coin_details['marketCapRank'] or '-'}</p>", unsafe_allow_html=True)
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            st.markdown("<h4>24სთ ცვლილება</h4>", unsafe_allow_html=True)
+            daily_change_class = 'positive' if (coin_details['dailyChange'] or 0) >= 0 else 'negative'
+            st.markdown(f"<p class='value {daily_change_class}'>{coin_details['dailyChange']:.2f}%</p>", unsafe_allow_html=True)
+        with col_m2:
+            st.markdown("<h4>24სთ მოცულობა</h4>", unsafe_allow_html=True)
+            st.markdown(f"<p class='value'>{format_currency(coin_details['24hVolume'])}</p>", unsafe_allow_html=True)
+        with col_m3:
+            st.markdown("<h4>კაპიტალიზაცია</h4>", unsafe_allow_html=True)
+            st.markdown(f"<p class='value'>{format_currency(coin_details['marketCap'])}</p>", unsafe_allow_html=True)
+        with col_m4:
+            st.markdown("<h4>რანგი</h4>", unsafe_allow_html=True)
+            st.markdown(f"<p class='value'>#{coin_details['marketCapRank'] or '-'}</p>", unsafe_allow_html=True)
 
-                    col_m5, col_m6 = st.columns(2)
-                    with col_m5:
-                        st.markdown("<h4>ATH</h4>", unsafe_allow_html=True)
-                        st.markdown(f"<p class='value'>{format_price(coin_details['ath'])} $</p>", unsafe_allow_html=True)
-                    with col_m6:
-                        st.markdown("<h4>ATL</h4>", unsafe_allow_html=True)
-                        st.markdown(f"<p class='value'>{format_price(coin_details['atl'])} $</p>", unsafe_allow_html=True)
+    st.markdown("---")
 
-                else:
-                    st.error("მონაცემები ვერ მოიძებნა ამ კრიპტოვალუტისთვის.")
-        else:
-            st.warning("გთხოვთ, აირჩიოთ ვალიდური კრიპტოვალუტის სიმბოლო.")
-
-with col2:
-    with st.container(border=False):
-        st.markdown(f"<div class='chart-header'><h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3></div>", unsafe_allow_html=True)
+    st.markdown(f"<h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3>", unsafe_allow_html=True)
+    historical_data_list = fetch_historical_data_sqlite(coingecko_id, days=st.session_state.selected_period)
+    
+    if historical_data_list:
+        df_historical = pd.DataFrame(historical_data_list)
+        df_historical['date'] = pd.to_datetime(df_historical['date'])
         
-        coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
-        if coingecko_id and coin_details:
-            historical_data_list = fetch_historical_data_sqlite(coingecko_id, days=st.session_state.selected_period)
-            
-            if historical_data_list:
-                df_historical = pd.DataFrame(historical_data_list)
-                df_historical['date'] = pd.to_datetime(df_historical['date'])
-                
-                forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
-                
-                with st.spinner(f"მიმდინარეობს {model_choice} მოდელით პროგნოზირება..."):
-                    prediction_data_list = forecaster.generate_predictions(model_choice=model_choice, days=PREDICTION_DAYS)
-                
-                if not prediction_data_list:
-                    st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა {model_choice} მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
-                
-                df_prediction = pd.DataFrame(prediction_data_list)
-                if not df_prediction.empty:
-                    df_prediction['date'] = pd.to_datetime(df_prediction['date'])
-                
-                signals = forecaster.generate_signals_from_prediction(prediction_data_list)
-                
-                df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.selected_period).copy()
+        forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical)
+        
+        with st.spinner(f"მიმდინარეობს {model_choice} მოდელით პროგნოზირება..."):
+            prediction_data_list = forecaster.generate_predictions(model_choice=model_choice, days=PREDICTION_DAYS)
+        
+        if not prediction_data_list:
+            st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა {model_choice} მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
+        
+        df_prediction = pd.DataFrame(prediction_data_list)
+        if not df_prediction.empty:
+            df_prediction['date'] = pd.to_datetime(df_prediction['date'])
+        
+        signals = forecaster.generate_signals_from_prediction(prediction_data_list)
+        
+        df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.selected_period).copy()
+        support_level, resistance_level = calculate_support_resistance(df_historical.tail(st.session_state.selected_period))
 
-                support_level, resistance_level = calculate_support_resistance(df_historical.tail(st.session_state.selected_period))
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.6, 0.2, 0.2],
+                            subplot_titles=(
+                                f"{st.session_state.current_symbol} ფასი და პროგნოზი",
+                                "Relative Strength Index (RSI)",
+                                "Moving Average Convergence Divergence (MACD)"
+                            ))
+        fig.add_trace(go.Candlestick(x=df_indicators_display.index, open=df_indicators_display['open'], high=df_indicators_display['high'],
+                                     low=df_indicators_display['low'], close=df_indicators_display['close'], name='ისტორია', showlegend=False), row=1, col=1)
+        if not df_prediction.empty:
+            fig.add_trace(go.Scatter(x=df_prediction['date'], y=df_prediction['close'], mode='lines', name='პროგნოზი', line=dict(color='#8e2de2', dash='dot', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['MA7'], mode='lines', name='MA(7)', line=dict(color='yellow', width=1, dash='solid')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['MA25'], mode='lines', name='MA(25)', line=dict(color='orange', width=1, dash='solid')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['MA99'], mode='lines', name='MA(99)', line=dict(color='lightgreen', width=1, dash='solid')), row=1, col=1)
+        if support_level:
+            fig.add_hline(y=support_level, line_dash="solid", line_color="#00a3e0", opacity=0.8, annotation_text=f"Support: {format_price(support_level)} $", annotation_position="bottom right", row=1, col=1)
+        if resistance_level:
+            fig.add_hline(y=resistance_level, line_dash="solid", line_color="#ff5733", opacity=0.8, annotation_text=f"Breakout: {format_price(resistance_level)} $", annotation_position="top right", row=1, col=1)
+        for signal in signals:
+            signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
+            if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
+                fig.add_trace(go.Scatter(x=[signal['date']], y=[signal['price']], mode='markers+text', name=f"{signal['type']} სიგნალი", marker=dict(symbol='circle', size=10, color=signal_color, line=dict(width=2, color=signal_color)), text=[signal['type']], textposition="top center" if signal['type'] == 'BUY' else "bottom center", textfont=dict(family="sans-serif", size=12, color=signal_color), hoverinfo='text', hovertext=f"<b>{signal['type']}</b><br>თარიღი: {signal['date'].strftime('%Y-%m-%d')}<br>ფასი: {format_price(signal['price'])} $", showlegend=False), row=1, col=1)
 
-                fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                                    vertical_spacing=0.08, 
-                                    row_heights=[0.6, 0.2, 0.2],
-                                    subplot_titles=(
-                                        f"{st.session_state.current_symbol} ფასი და პროგნოზი",
-                                        "Relative Strength Index (RSI)",
-                                        "Moving Average Convergence Divergence (MACD)"
-                                    ))
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['RSI'], mode='lines', name='RSI', line=dict(color='cyan', width=2)), row=2, col=1)
+        fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought (70)", annotation_position="top right", annotation_font_color="red")
+        fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold (30)", annotation_position="bottom right", annotation_font_color="green")
 
-                fig.add_trace(go.Candlestick(
-                    x=df_indicators_display.index,
-                    open=df_indicators_display['open'],
-                    high=df_indicators_display['high'],
-                    low=df_indicators_display['low'],
-                    close=df_indicators_display['close'],
-                    name='ისტორია',
-                    showlegend=False
-                ), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['MACD'], mode='lines', name='MACD Line', line=dict(color='blue', width=2)), row=3, col=1)
+        fig.add_trace(go.Scatter(x=df_indicators_display.index, y=df_indicators_display['Signal_Line'], mode='lines', name='Signal Line', line=dict(color='purple', width=1)), row=3, col=1)
+        fig.add_trace(go.Bar(x=df_indicators_display.index, y=df_indicators_display['MACD_Histogram'], name='MACD Histogram', marker_color=['red' if val < 0 else 'green' for val in df_indicators_display['MACD_Histogram']], opacity=0.6), row=3, col=1)
+        fig.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
 
-                if not df_prediction.empty:
-                    fig.add_trace(go.Scatter(
-                        x=df_prediction['date'],
-                        y=df_prediction['close'],
-                        mode='lines',
-                        name='პროგნოზი',
-                        line=dict(color='#8e2de2', dash='dot', width=2)
-                    ), row=1, col=1)
+        fig.update_layout(height=700, xaxis_rangeslider_visible=False, template='plotly_dark', hovermode='x unified', margin=dict(l=0, r=0, t=50, b=0), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color=st.get_option('theme.textColor')),
+                          legend=dict(orientation="h", yanchor="top", y=1.05, xanchor="left", x=0, bgcolor='rgba(0,0,0,0)', bordercolor='rgba(0,0,0,0)', font=dict(color=st.get_option('theme.textColor'))))
+        fig.update_yaxes(title_text='ფასი (USD)', row=1, col=1)
+        fig.update_yaxes(title_text='RSI', range=[0, 100], row=2, col=1)
+        fig.update_yaxes(title_text='MACD', row=3, col=1)
+        fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=1, col=1)
+        fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=2, col=1)
+        fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=3, col=1)
 
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['MA7'],
-                    mode='lines',
-                    name='MA(7)',
-                    line=dict(color='yellow', width=1, dash='solid')
-                ), row=1, col=1)
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['MA25'],
-                    mode='lines',
-                    name='MA(25)',
-                    line=dict(color='orange', width=1, dash='solid')
-                ), row=1, col=1)
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['MA99'],
-                    mode='lines',
-                    name='MA(99)',
-                    line=dict(color='lightgreen', width=1, dash='solid')
-                ), row=1, col=1)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("""
+        <div class="chart-legend">
+            <div class="legend-item"><div class="legend-color historical"></div><span>ისტორია</span></div>
+            <div class="legend-item"><div class="legend-color prediction"></div><span>პროგნოზი</span></div>
+            <div class="legend-item"><div class="legend-color" style="background-color: yellow;"></div><span>MA(7)</span></div>
+            <div class="legend-item"><div class="legend-color" style="background-color: orange;"></div><span>MA(25)</span></div>
+            <div class="legend-item"><div class="legend-color" style="background-color: lightgreen;"></div><span>MA(99)</span></div>
+            <div class="legend-item"><div class="legend-color buy-signal-legend"></div><span>ყიდვა</span></div>
+            <div class="legend-item"><div class="legend-color sell-signal-legend"></div><span>გაყიდვა</span></div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("---")
 
-                if support_level:
-                    fig.add_hline(y=support_level, line_dash="solid", line_color="#00a3e0", opacity=0.8, annotation_text=f"Support: {format_price(support_level)} $", annotation_position="bottom right", row=1, col=1)
-                if resistance_level:
-                    fig.add_hline(y=resistance_level, line_dash="solid", line_color="#ff5733", opacity=0.8, annotation_text=f"Breakout: {format_price(resistance_level)} $", annotation_position="top right", row=1, col=1)
-
-                for signal in signals:
-                    signal_color = "#39ff14" if signal['type'] == 'BUY' else "#ff073a"
-                    if not df_prediction.empty and (signal['date'] >= df_indicators_display.index.min() or signal['date'] >= df_prediction['date'].min()):
-                        fig.add_trace(go.Scatter(
-                            x=[signal['date']],
-                            y=[signal['price']],
-                            mode='markers+text',
-                            name=f"{signal['type']} სიგნალი",
-                            marker=dict(
-                                symbol='circle',
-                                size=10, 
-                                color=signal_color,
-                                line=dict(width=2, color=signal_color) 
-                            ),
-                            text=[signal['type']],
-                            textposition="top center" if signal['type'] == 'BUY' else "bottom center",
-                            textfont=dict(
-                                family="sans-serif",
-                                size=12,
-                                color=signal_color
-                            ),
-                            hoverinfo='text',
-                            hovertext=f"<b>{signal['type']}</b><br>თარიღი: {signal['date'].strftime('%Y-%m-%d')}<br>ფასი: {format_price(signal['price'])} $",
-                            showlegend=False
-                        ), row=1, col=1)
-
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['RSI'],
-                    mode='lines',
-                    name='RSI',
-                    line=dict(color='cyan', width=2)
-                ), row=2, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought (70)", annotation_position="top right", annotation_font_color="red")
-                fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold (30)", annotation_position="bottom right", annotation_font_color="green")
-
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['MACD'],
-                    mode='lines',
-                    name='MACD Line',
-                    line=dict(color='blue', width=2)
-                ), row=3, col=1)
-                fig.add_trace(go.Scatter(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['Signal_Line'],
-                    mode='lines',
-                    name='Signal Line',
-                    line=dict(color='purple', width=1)
-                ), row=3, col=1)
-                fig.add_trace(go.Bar(
-                    x=df_indicators_display.index,
-                    y=df_indicators_display['MACD_Histogram'],
-                    name='MACD Histogram',
-                    marker_color=['red' if val < 0 else 'green' for val in df_indicators_display['MACD_Histogram']],
-                    opacity=0.6
-                ), row=3, col=1)
-                fig.add_hline(y=0, line_dash="dot", line_color="gray", row=3, col=1)
-
-
-                fig.update_layout(
-                    height=700,
-                    xaxis_rangeslider_visible=False,
-                    template='plotly_dark',
-                    hovermode='x unified',
-                    margin=dict(l=0, r=0, t=50, b=0),
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    font=dict(color=st.get_option('theme.textColor')),
-                    legend=dict(
-                        orientation="h",
-                        yanchor="top",
-                        y=1.05,
-                        xanchor="left",
-                        x=0,
-                        bgcolor='rgba(0,0,0,0)',
-                        bordercolor='rgba(0,0,0,0)',
-                        font=dict(color=st.get_option('theme.textColor'))
-                    )
-                )
-                fig.update_yaxes(title_text='ფასი (USD)', row=1, col=1)
-                fig.update_yaxes(title_text='RSI', range=[0, 100], row=2, col=1)
-                fig.update_yaxes(title_text='MACD', row=3, col=1)
-                fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=1, col=1)
-                fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=2, col=1)
-                fig.update_xaxes(showgrid=False, zeroline=False, tickfont=dict(color=st.get_option('theme.secondaryBackgroundColor')), title_font=dict(color=st.get_option('theme.textColor')), row=3, col=1)
-
-
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.markdown("""
-                <div class="chart-legend">
-                    <div class="legend-item"><div class="legend-color historical"></div><span>ისტორია</span></div>
-                    <div class="legend-item"><div class="legend-color prediction"></div><span>პროგნოზი</span></div>
-                    <div class="legend-item"><div class="legend-color" style="background-color: yellow;"></div><span>MA(7)</span></div>
-                    <div class="legend-item"><div class="legend-color" style="background-color: orange;"></div><span>MA(25)</span></div>
-                    <div class="legend-item"><div class="legend-color" style="background-color: lightgreen;"></div><span>MA(99)</span></div>
-                    <div class="legend-item"><div class="legend-color buy-signal-legend"></div><span>ყიდვა</span></div>
-                    <div class="legend-item"><div class="legend-color sell-signal-legend"></div><span>გაყიდვა</span></div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                st.markdown("---")
-                st.markdown("<h4><i class='fas fa-chart-line'></i> ტექნიკური ინდიკატორების განმარტებები</h4>", unsafe_allow_html=True)
-                
-                st.markdown("""
-                <div class="argumentation-box">
-                    <p><span class='modal-label'>მოძრავი საშუალო (MA):</span> მოძრავი საშუალო (Moving Average) აჩვენებს ფასის საშუალო მნიშვნელობას განსაზღვრულ პერიოდში (მაგ., 7, 25, 99 დღე). ის გამოიყენება ტრენდის იდენტიფიცირებისთვის და ფასის "ხმაურის" გასაგლუვებლად. მოკლევადიანი MA-ს გრძელვადიან MA-ზე ზემოთ კვეთა (ე.წ. Golden Cross) განიხილება აღმავალი ტრენდის სიგნალად, ხოლო ქვემოთ კვეთა (Death Cross) - დაღმავალი ტრენდის სიგნალად.</p>
-                    <p><span class='modal-label'>Support & Breakout Levels:</span> Support Level არის ფასის დონე, რომელზეც მოსალოდნელია აქტივის ფასის ვარდნის შეჩერება და უკან ამოსვლა. Breakout Level (ან Resistance Level) არის ფასის დონე, რომელზეც მოსალოდნელია ფასის ზრდის შეჩერება და უკან დაცემა. ამ დონეების გარღვევა ხშირად ძლიერი ტრენდის ცვლილების სიგნალია.</p>
-                    <p><span class='modal-label'>Relative Strength Index (RSI):</span> RSI არის იმპულსის ოსცილატორი, რომელიც ზომავს ფასის ცვლილებების სიჩქარესა და ცვლილებას. ის მერყეობს 0-დან 100-მდე. 70-ზე ზემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Overbought) და შესაძლოა ფასის კორექცია მოხდეს. 30-ზე ქვემოთ ნიშნავს, რომ აქტივი ზედმეტად გაყიდულია (Oversold) და შესაძლოა ფასის ზრდა დაიწყოს.</p>
-                    <p><span class='modal-label'>Moving Average Convergence Divergence (MACD):</span> MACD არის ტრენდის მიმდევარი იმპულსის ინდიკატორი, რომელიც აჩვენებს ფასის ორ ექსპონენციალურ მოძრავ საშუალოს (EMA) შორის ურთიერთობას (ჩვეულებრივ, 12-დღიანი და 26-დღიანი EMA). MACD ხაზის სასიგნალო ხაზის (9-დღიანი MACD-ის EMA) ზემოთ კვეთა არის ყიდვის სიგნალი, ხოლო ქვემოთ კვეთა - გაყიდვის სიგნალი. MACD ჰისტოგრამა აჩვენებს MACD ხაზსა და სასიგნალო ხაზს შორის განსხვავებას და გამოიყენება იმპულსის სიმძლავრის გასაზომად.</p>
-                    <p><span class='modal-label'>LSTM (Long Short-Term Memory):</span> LSTM არის ხელოვნური ნერონული ქსელის სპეციალური ტიპი, რომელიც განსაკუთრებით ეფექტურია დროითი სერიების მონაცემების დასამუშავებლად და პროგნოზირებისთვის. მას შეუძლია ისწავლოს დამოკიდებულებები მონაცემებში როგორც მოკლე, ასევე გრძელვადიან პერსპექტივაში, რაც მას სასარგებლოს ხდის კომპლექსური ფინანსური მონაცემების მოდელირებისთვის.
-                </div>
-                """, unsafe_allow_html=True)
-
-            else:
-                st.warning("ისტორიული მონაცემები ვერ მოიძებნა არჩეული პერიოდისთვის.")
-        else:
-            st.info("აირჩიეთ კრიპტოვალუტა მონაცემების სანახავად.")
-
-
-with col3:
-    with st.container(border=False):
         st.markdown("<h3>პროგნოზირებული სიგნალები</h3>", unsafe_allow_html=True)
-        
-        coingecko_id = COINGECKO_CRYPTO_MAP.get(st.session_state.current_symbol)
-        if coingecko_id and coin_details:
-            historical_data_list = fetch_historical_data_sqlite(coingecko_id, days=st.session_state.selected_period)
-            
-            forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list))
-            
-            with st.spinner(f"გენერირდება სიგნალები {model_choice} მოდელიდან..."):
-                prediction_data_list = forecaster.generate_predictions(model_choice=model_choice, days=PREDICTION_DAYS)
-            signals = forecaster.generate_signals_from_prediction(prediction_data_list)
-            
-            if signals:
-                st.markdown("<div id='signals-list' class='signals-list'>", unsafe_allow_html=True)
-                for signal in signals:
-                    signal_type_class = signal['type'].lower()
-                    st.markdown(f"""
-                    <div class="signal-item {signal_type_class}-signal-item">
-                        <div class="signal-header">
-                            <span class="signal-type {signal_type_class}-signal">
-                                <i class="fas fa-{"arrow-up" if signal['type'] == 'BUY' else "arrow-down"}"></i> {signal['type']}
-                            </span>
-                            <span class="signal-date">{signal['date'].strftime('%Y-%m-%d')}</span>
-                        </div>
-                        <p class="signal-price">ფასი: <span class="signal-price-value">{format_price(signal['price'])} $</span></p>
+        if signals:
+            st.markdown("<div id='signals-list' class='signals-list'>", unsafe_allow_html=True)
+            for signal in signals:
+                signal_type_class = signal['type'].lower()
+                st.markdown(f"""
+                <div class="signal-item {signal_type_class}-signal-item">
+                    <div class="signal-header">
+                        <span class="signal-type {signal_type_class}-signal">
+                            <i class="fas fa-{"arrow-up" if signal['type'] == 'BUY' else "arrow-down"}"></i> {signal['type']}
+                        </span>
+                        <span class="signal-date">{signal['date'].strftime('%Y-%m-%d')}</span>
                     </div>
-                    """, unsafe_allow_html=True)
-
-                    with st.expander(f"დეტალები: {signal['type']} {signal['date'].strftime('%Y-%m-%d')}"):
-                        st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
-                        st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
-                        st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
-                        st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4></div>", unsafe_allow_html=True) 
-                        st.markdown(f"<p>{signal['argumentation']}</p>", unsafe_allow_html=True)
-
-                st.markdown("</div>", unsafe_allow_html=True)
-            else:
-                st.markdown("<p class='no-signals'>რელევანტური სიგნალები არ მოიძებნა.</p>", unsafe_allow_html=True)
+                    <p class="signal-price">ფასი: <span class="signal-price-value">{format_price(signal['price'])} $</span></p>
+                </div>
+                """, unsafe_allow_html=True)
+                with st.expander(f"დეტალები: {signal['type']} {signal['date'].strftime('%Y-%m-%d')}"):
+                    st.markdown(f"<p><span class='modal-label'>თარიღი:</span> {signal['date'].strftime('%Y-%m-%d %H:%M:%S')}</p>", unsafe_allow_html=True)
+                    st.markdown(f"<p><span class='modal-label'>ფასი:</span> {format_price(signal['price'])} $</p>", unsafe_allow_html=True)
+                    st.markdown(f"<p><span class='modal-label'>სანდოობა:</span> {signal['confidence']}</p>", unsafe_allow_html=True)
+                    st.markdown("<div class='argumentation-box'><h4><i class='fas fa-brain'></i> AI ანალიზი:</h4></div>", unsafe_allow_html=True) 
+                    st.markdown(f"<p>{signal['argumentation']}</p>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
         else:
-            st.info("მონაცემები არ არის ხელმისაწვდომი სიგნალების მისაღებად.")
+            st.markdown("<p class='no-signals'>რელევანტური სიგნალები არ მოიძებნა.</p>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("<h4><i class='fas fa-chart-line'></i> ტექნიკური ინდიკატორების განმარტებები</h4>", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="argumentation-box">
+        <p><span class='modal-label'>მოძრავი საშუალო (MA):</span> მოძრავი საშუალო (Moving Average) აჩვენებს ფასის საშუალო მნიშვნელობას განსაზღვრულ პერიოდში (მაგ., 7, 25, 99 დღე). ის გამოიყენება ტრენდის იდენტიფიცირებისთვის და ფასის "ხმაურის" გასაგლუვებლად. მოკლევადიანი MA-ს გრძელვადიან MA-ზე ზემოთ კვეთა (ე.წ. Golden Cross) განიხილება აღმავალი ტრენდის სიგნალად, ხოლო ქვემოთ კვეთა (Death Cross) - დაღმავალი ტრენდის სიგნალად.</p>
+        <p><span class='modal-label'>Support & Breakout Levels:</span> Support Level არის ფასის დონე, რომელზეც მოსალოდნელია აქტივის ფასის ვარდნის შეჩერება და უკან ამოსვლა. Breakout Level (ან Resistance Level) არის ფასის დონე, რომელზეც მოსალოდნელია ფასის ზრდის შეჩერება და უკან დაცემა. ამ დონეების გარღვევა ხშირად ძლიერი ტრენდის ცვლილების სიგნალია.</p>
+        <p><span class='modal-label'>Relative Strength Index (RSI):</span> RSI არის იმპულსის ოსცილატორი, რომელიც ზომავს ფასის ცვლილებების სიჩქარესა და ცვლილებას. ის მერყეობს 0-დან 100-მდე. 70-ზე ზემოთ ნიშნავს, რომ აქტივი ზედმეტად ნაყიდია (Overbought) და შესაძლოა ფასის კორექცია მოხდეს. 30-ზე ქვემოთ ნიშნავს, რომ აქტივი ზედმეტად გაყიდულია (Oversold) და შესაძლოა ფასის ზრდა დაიწყოს.</p>
+        <p><span class='modal-label'>Moving Average Convergence Divergence (MACD):</span> MACD არის ტრენდის მიმდევარი იმპულსის ინდიკატორი, რომელიც აჩვენებს ფასის ორ ექსპონენციალურ მოძრავ საშუალოს (EMA) შორის ურთიერთობას (ჩვეულებრივ, 12-დღიანი და 26-დღიანი EMA). MACD ხაზის სასიგნალო ხაზის (9-დღიანი MACD-ის EMA) ზემოთ კვეთა არის ყიდვის სიგნალი, ხოლო ქვემოთ კვეთა - გაყიდვის სიგნალი. MACD ჰისტოგრამა აჩვენებს MACD ხაზსა და სასიგნალო ხაზს შორის განსხვავებას და გამოიყენება იმპულსის სიმძლავრის გასაზომად.</p>
+        <p><span class='modal-label'>LSTM (Long Short-Term Memory):</span> LSTM არის ხელოვნური ნერონული ქსელის სპეციალური ტიპი, რომელიც განსაკუთრებით ეფექტურია დროითი სერიების მონაცემების დასამუშავებლად და პროგნოზირებისთვის. მას შეუძლია ისწავლოს დამოკიდებულებები მონაცემებში როგორც მოკლე, ასევე გრძელვადიან პერსპექტივაში, რაც მას სასარგებლოს ხდის კომპლექსური ფინანსური მონაცემების მოდელირებისთვის.
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.info("აირჩიეთ კრიპტოვალუტა მონაცემების სანახავად.")
+
 
 st.markdown("---")
 st.markdown(f"""
