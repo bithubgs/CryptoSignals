@@ -947,5 +947,3 @@ st.markdown(f"""
     <p>მონაცემები მოწოდებულია <a href="https://www.coingecko.com" target="_blank">CoinGecko API</a>-ს მიერ | ბოლო განახლება: {datetime.datetime.now().strftime('%H:%M:%S')}</p>
 </footer>
 """, unsafe_allow_html=True)
-app.py
-Displaying app.py.
