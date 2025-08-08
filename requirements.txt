@@ -1,7 +1,6 @@
 streamlit
 requests
 pandas
-pandas_ta
 plotly
 statsmodels
 prophet
