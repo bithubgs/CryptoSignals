@@ -19,17 +19,23 @@ except ImportError:
 
 try:
     from sklearn.preprocessing import MinMaxScaler
+    # Import tensorflow and keras separately to handle potential dependency issues
+    import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.optimizers import Adam
+    
     # Suppress TensorFlow warnings
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
-    import tensorflow as tf
     tf.get_logger().setLevel('ERROR') # Only show errors
     LSTM_AVAILABLE = True
-except ImportError:
-    st.error("TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy")
+except ImportError as e:
+    st.error(f"TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy. დეტალები: {e}")
     LSTM_AVAILABLE = False
+except Exception as e:
+    st.error(f"შეცდომა TensorFlow-ის იმპორტისას. ეს ხშირად გამოწვეულია დამოკიდებულებების პრობლემით. სცადეთ გაუშვათ `pip install ml-dtypes==0.2.0` თქვენს ტერმინალში. დეტალები: {e}")
+    LSTM_AVAILABLE = False
+
 
 # --- Set page config for wide mode ---
 st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
