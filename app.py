@@ -230,67 +230,71 @@ class CryptoDataForecaster:
         if not LSTM_AVAILABLE:
             return []
 
-        df_lstm = self.historical_with_indicators[['close', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
-        
-        if len(df_lstm) < 100:
-            st.warning(f"არასაკმარისი სუფთა მონაცემები (MA, RSI, MACD-ით) LSTM პროგნოზისთვის (მინიმუმ 100 დღე).")
-            return []
-
-        look_back = 60
-        n_features = df_lstm.shape[1]
-
-        data_scaled = MinMaxScaler(feature_range=(0, 1)).fit_transform(df_lstm.values)
-        scaler_price = MinMaxScaler(feature_range=(0, 1))
-        scaler_price.fit(df_lstm['close'].values.reshape(-1, 1)) 
-
-        X, y = [], []
-        for i in range(len(data_scaled) - look_back):
-            X.append(data_scaled[i:(i + look_back), :])
-            y.append(data_scaled[i + look_back, 0])
-        X = np.array(X)
-        y = np.array(y)
-        
-        model = Sequential()
-        model.add(LSTM(units=100, return_sequences=True, input_shape=(look_back, n_features)))
-        model.add(Dropout(0.3))
-        model.add(LSTM(units=100, return_sequences=False))
-        model.add(Dropout(0.3))
-        model.add(Dense(units=1)) 
-        model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
-        
         try:
-            model.fit(X, y, epochs=50, batch_size=32, verbose=0) 
+            df_lstm = self.historical_with_indicators[['close', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
+            
+            if len(df_lstm) < 100:
+                st.warning(f"არასაკმარისი სუფთა მონაცემები (MA, RSI, MACD-ით) LSTM პროგნოზისთვის (მინიმუმ 100 დღე).")
+                return []
+
+            look_back = 60
+            n_features = df_lstm.shape[1]
+
+            data_scaled = MinMaxScaler(feature_range=(0, 1)).fit_transform(df_lstm.values)
+            scaler_price = MinMaxScaler(feature_range=(0, 1))
+            scaler_price.fit(df_lstm['close'].values.reshape(-1, 1)) 
+
+            X, y = [], []
+            for i in range(len(data_scaled) - look_back):
+                X.append(data_scaled[i:(i + look_back), :])
+                y.append(data_scaled[i + look_back, 0])
+            X = np.array(X)
+            y = np.array(y)
+            
+            model = Sequential()
+            model.add(LSTM(units=100, return_sequences=True, input_shape=(look_back, n_features)))
+            model.add(Dropout(0.3))
+            model.add(LSTM(units=100, return_sequences=False))
+            model.add(Dropout(0.3))
+            model.add(Dense(units=1)) 
+            model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+            
+            try:
+                model.fit(X, y, epochs=50, batch_size=32, verbose=0) 
+            except Exception as e:
+                st.error(f"შეცდომა LSTM მოდელის ტრენინგისას: {e}. პროგნოზი მიუწვდომელია.")
+                return []
+
+            prediction_list = []
+            current_input = data_scaled[-look_back:].reshape(1, look_back, n_features)
+            last_date_original = self.historical_prices.index[-1]
+
+            for i in range(days):
+                predicted_scaled_price = model.predict(current_input, verbose=0)[0, 0]
+                predicted_price = scaler_price.inverse_transform([[predicted_scaled_price]])[0, 0]
+                
+                date = last_date_original + datetime.timedelta(days=i+1)
+                prediction_list.append({'date': date, 'close': max(0.00000001, round(predicted_price, 8)), 'type': 'prediction'})
+                
+                last_features_scaled = current_input[0, -1, :].copy()
+                last_features_scaled[0] = predicted_scaled_price
+                current_input = np.append(current_input[:, 1:, :], last_features_scaled.reshape(1, 1, n_features), axis=1)
+
+            return prediction_list
         except Exception as e:
-            st.error(f"შეცდომა LSTM მოდელის ტრენინგისას: {e}. პროგნოზი მიუწვდომელია.")
+            st.error(f"შეცდომა LSTM მოდელის გენერირებისას: {e}")
             return []
-
-        prediction_list = []
-        current_input = data_scaled[-look_back:].reshape(1, look_back, n_features)
-        last_date_original = self.historical_prices.index[-1]
-
-        for i in range(days):
-            predicted_scaled_price = model.predict(current_input, verbose=0)[0, 0]
-            predicted_price = scaler_price.inverse_transform([[predicted_scaled_price]])[0, 0]
-            
-            date = last_date_original + datetime.timedelta(days=i+1)
-            prediction_list.append({'date': date, 'close': max(0.00000001, round(predicted_price, 8)), 'type': 'prediction'})
-            
-            last_features_scaled = current_input[0, -1, :].copy()
-            last_features_scaled[0] = predicted_scaled_price
-            current_input = np.append(current_input[:, 1:, :], last_features_scaled.reshape(1, 1, n_features), axis=1)
-
-        return prediction_list
 
     def _generate_prophet_predictions(self, days):
         if not Prophet:
             return []
-
-        df_prophet = self.historical_prices[['close']].reset_index()
-        df_prophet.columns = ['ds', 'y']
         
-        model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False,
-                        changepoint_prior_scale=0.1, seasonality_prior_scale=10.0)
         try:
+            df_prophet = self.historical_prices[['close']].reset_index()
+            df_prophet.columns = ['ds', 'y']
+            
+            model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False,
+                            changepoint_prior_scale=0.1, seasonality_prior_scale=10.0)
             model.fit(df_prophet)
             future = model.make_future_dataframe(periods=days)
             forecast = model.predict(future)
@@ -299,7 +303,7 @@ class CryptoDataForecaster:
                 item['type'] = 'prediction'
             return prediction_list
         except Exception as e:
-            st.error(f"შეცდომა Prophet მოდელით პროგნოზირებისას: {e}")
+            st.error(f"შეცდომა Prophet მოდელით პროგნოზირებისას: {e}. შესაძლოა, Prophet არ დაინსტალირდა სწორად.")
             return []
 
 
@@ -598,7 +602,7 @@ with st.sidebar:
     cols_period = st.columns(len(periods))
     
     for i, period in enumerate(periods):
-        with cols_period[i]:
+        with cols_pop[i]:
             if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True):
                 st.session_state.selected_period = period
                 st.rerun()
