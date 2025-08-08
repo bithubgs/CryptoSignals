@@ -8,31 +8,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import sqlite3
 import os
-
-# Import forecasting models with checks
-try:
-    from prophet import Prophet
-except ImportError:
-    st.error("Prophet მოდული ვერ მოიძებნა. დააინსტალირეთ 'prophet': pip install prophet")
-    Prophet = None
-
-try:
-    import numpy as np
-    from sklearn.preprocessing import MinMaxScaler
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.optimizers import Adam
-    # Suppress TensorFlow warnings
-    import os
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
-    import tensorflow as tf
-    tf.get_logger().setLevel('ERROR') # Only show errors
-except ImportError:
-    st.error("TensorFlow/Keras, Scikit-learn, ან NumPy მოდულები ვერ მოიძებნა. დააინსტალირეთ: pip install tensorflow scikit-learn numpy")
-    LSTM_AVAILABLE = False
-else:
-    LSTM_AVAILABLE = True
-
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+# Suppress TensorFlow warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress info and warnings
+import tensorflow as tf
+tf.get_logger().setLevel('ERROR') # Only show errors
 
 # --- Set page config for wide mode ---
 st.set_page_config(layout="wide", page_title="კრიპტო სიგნალები LIVE", page_icon="📈")
@@ -57,6 +41,9 @@ def init_db():
     """Initializes the SQLite database and creates the table if it doesn't exist."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Drop the table to ensure a clean state and prevent schema mismatch errors
+    # NOTE: Comment this line out if you want to keep data persistently across runs
+    cursor.execute('DROP TABLE IF EXISTS historical_prices')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS historical_prices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,70 +114,76 @@ def fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS):
                    (coingecko_id, earliest_date_needed))
     
     db_data = cursor.fetchall()
+    
+    # Check if cache is outdated or incomplete
+    should_update = True
     if db_data:
         latest_date_in_db = max([row[0] for row in db_data])
-        if len(db_data) >= days and latest_date_in_db == datetime.date.today().strftime('%Y-%m-%d'):
+        if latest_date_in_db == datetime.date.today().strftime('%Y-%m-%d') and len(db_data) >= days:
+            should_update = False
             st.toast(f"ისტორიული მონაცემები ჩაიტვირთა SQLite ქეშიდან: {coingecko_id}", icon="💾")
-            historical_data = []
-            for row in db_data:
-                historical_data.append({
-                    'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'),
-                    'open': row[1],
-                    'high': row[2],
-                    'low': row[3],
-                    'close': row[4],
+            
+    if should_update:
+        st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. განახლება API-დან: {coingecko_id}")
+
+        st.toast(f"მიმდინარეობს ისტორიული მონაცემების ჩატვირთვა API-დან: {coingecko_id}", icon="🌐")
+        try:
+            rate_limit_api_call()
+            url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/ohlc"
+            params = {'vs_currency': 'usd', 'days': str(days)} # OHLC endpoint
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            api_data = response.json()
+            
+            fetched_historical_data = []
+            for p in api_data:
+                date_obj = datetime.datetime.fromtimestamp(p[0] / 1000)
+                fetched_historical_data.append({
+                    'date': date_obj, 
+                    'open': round(p[1], 8),
+                    'high': round(p[2], 8),
+                    'low': round(p[3], 8),
+                    'close': round(p[4], 8),
                     'type': 'historical'
                 })
+            
+            # Save/Update to SQLite
+            for entry in fetched_historical_data:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price_open, price_high, price_low, price_close)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (coingecko_id, entry['date'].strftime('%Y-%m-%d'), entry['open'], entry['high'], entry['low'], entry['close']))
+            
+            conn.commit()
+            st.toast(f"ისტორიული მონაცემები შენახულია/განახლებულია SQLite-ში: {coingecko_id}", icon="💾")
+            
             conn.close()
-            return historical_data
-        else:
-            st.warning(f"SQLite ქეში მოძველებულია ან არასრულია. განახლება API-დან: {coingecko_id}")
+            return fetched_historical_data
 
-    st.toast(f"მიმდინარეობს ისტორიული მონაცემების ჩატვირთვა API-დან: {coingecko_id}", icon="🌐")
-    try:
-        rate_limit_api_call()
-        url = f"{COINGECKO_API_BASE}/coins/{coingecko_id}/ohlc"
-        params = {'vs_currency': 'usd', 'days': str(days)} # OHLC endpoint
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        api_data = response.json()
-        
-        fetched_historical_data = []
-        for p in api_data:
-            date_obj = datetime.datetime.fromtimestamp(p[0] / 1000)
-            fetched_historical_data.append({
-                'date': date_obj, 
-                'open': round(p[1], 8),
-                'high': round(p[2], 8),
-                'low': round(p[3], 8),
-                'close': round(p[4], 8),
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                st.error(f"Error: Coingecko API ლიმიტი გადაჭარბებულია ისტორიული მონაცემებისთვის. გთხოვთ, სცადოთ მოგვიანებით. ({e})")
+            else:
+                st.error(f"Error fetching historical data for {coingecko_id}: {e}")
+            conn.close()
+            return []
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error fetching historical data for {coingecko_id}: {e}")
+            conn.close()
+            return []
+    else:
+        historical_data = []
+        for row in db_data:
+            historical_data.append({
+                'date': datetime.datetime.strptime(row[0], '%Y-%m-%d'),
+                'open': row[1],
+                'high': row[2],
+                'low': row[3],
+                'close': row[4],
                 'type': 'historical'
             })
-        
-        # Save/Update to SQLite
-        for entry in fetched_historical_data:
-            cursor.execute('''
-                INSERT OR REPLACE INTO historical_prices (coingecko_id, date, price_open, price_high, price_low, price_close)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (coingecko_id, entry['date'].strftime('%Y-%m-%d'), entry['open'], entry['high'], entry['low'], entry['close']))
-        
-        conn.commit()
-        st.toast(f"ისტორიული მონაცემები შენახულია/განახლებულია SQLite-ში: {coingecko_id}", icon="💾")
-        
         conn.close()
-        return fetched_historical_data
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 429:
-            st.error(f"Error: Coingecko API ლიმიტი გადაჭარბებულია ისტორიული მონაცემებისთვის. გთხოვთ, სცადოთ მოგვიანებით. ({e})")
-        else:
-            st.error(f"Error fetching historical data for {coingecko_id}: {e}")
-        conn.close()
-        return []
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching historical data for {coingecko_id}: {e}")
-        conn.close()
-        return []
+        return historical_data
 
 
 def calculate_support_resistance(df, window=20):
@@ -223,10 +216,6 @@ class CryptoDataForecaster:
         self.historical_with_indicators = self.calculate_technical_indicators()
 
     def _generate_lstm_predictions(self, days):
-        if not LSTM_AVAILABLE:
-            st.error("LSTM მოდელი არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ TensorFlow/Keras, NumPy და Scikit-learn.")
-            return []
-        
         df_lstm = self.historical_with_indicators[['close', 'MA7', 'MA25', 'RSI', 'MACD']].dropna()
         
         if len(df_lstm) < 100:
@@ -278,44 +267,12 @@ class CryptoDataForecaster:
 
         return prediction_list
 
-    def generate_predictions(self, days=PREDICTION_DAYS, model_choice="Prophet Model"):
+    def generate_predictions(self, days=PREDICTION_DAYS):
         if self.historical_prices.empty:
             st.warning("ისტორიული მონაცემები არ არის პროგნოზირებისთვის.")
             return []
-
-        prediction_data = []
-
-        if model_choice == "Prophet Model":
-            if Prophet is None:
-                st.error("Prophet მოდული არ არის ხელმისაწვდომი. გთხოვთ, დააინსტალიროთ 'prophet'.")
-                return []
-            if len(self.historical_prices) < 90:
-                st.warning("არასაკმარისი მონაცემები Prophet პროგნოზისთვის (მინიმუმ 90 დღე).")
-                return []
-
-            df_prophet = self.historical_prices.reset_index()[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
-            df_prophet['ds'] = pd.to_datetime(df_prophet['ds'])
-
-            try:
-                model = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, changepoint_prior_scale=0.1) 
-                model.fit(df_prophet)
-                future = model.make_future_dataframe(periods=days)
-                forecast = model.predict(future)
-                
-                for _, row in forecast.tail(days).iterrows():
-                    prediction_data.append({
-                        'date': row['ds'], 
-                        'close': max(0.00000001, round(row['yhat'], 8)), 
-                        'type': 'prediction'
-                    })
-            except Exception as e:
-                st.error(f"შეცდომა Prophet მოდელის გაშვებისას: {e}. პროგნოზი მიუწვდომელია.")
-                return []
-
-        elif model_choice == "LSTM Model":
-            prediction_data = self._generate_lstm_predictions(days)
         
-        return prediction_data
+        return self._generate_lstm_predictions(days)
 
     def generate_signals_from_prediction(self, prediction_data):
         if len(prediction_data) < 7:
@@ -418,7 +375,6 @@ st.markdown("""
         --border-color: #333;
     }
     
-    /* Apply font and background to the Streamlit app */
     .stApp {
         font-family: 'Inter', sans-serif;
         background: var(--bg-dark);
@@ -572,10 +528,6 @@ st.markdown("""
 
 if 'current_symbol' not in st.session_state:
     st.session_state.current_symbol = 'SAND'
-if 'current_period' not in st.session_state:
-    st.session_state.current_period = 90
-if 'prediction_model' not in st.session_state:
-    st.session_state.prediction_model = "Prophet Model"
 
 col1, col2, col3 = st.columns([0.8, 1.5, 0.8])
 
@@ -650,26 +602,7 @@ with col2:
     with st.container(border=False):
         st.markdown(f"<div class='chart-header'><h3>{st.session_state.current_symbol} ფასის დინამიკა და AI პროგნოზი</h3></div>", unsafe_allow_html=True)
         
-        filter_cols = st.columns(3)
-        periods = [90, 30, 7]
-        for i, period in enumerate(periods):
-            with filter_cols[i]:
-                if st.button(f"{period} დღე", key=f"period_{period}", use_container_width=True, type="secondary" if st.session_state.current_period != period else "primary"):
-                    st.session_state.current_period = period
-                    st.toast(f"Showing {period} days data for {st.session_state.current_symbol}...", icon="📊")
-        
-        model_options = ["Prophet Model"]
-        if LSTM_AVAILABLE:
-            model_options.append("LSTM Model")
-
-        selected_model = st.selectbox(
-            "აირჩიეთ პროგნოზირების მოდელი:",
-            model_options,
-            index=model_options.index(st.session_state.prediction_model)
-        )
-        if selected_model != st.session_state.prediction_model:
-            st.session_state.prediction_model = selected_model
-            st.rerun()
+        st.markdown("<span><i class='fas fa-chart-line'></i> მონაცემები ნაჩვენებია მაქსიმალური პერიოდისთვის (365 დღე), რაც ოპტიმალურია LSTM პროგნოზისთვის.</span>", unsafe_allow_html=True)
 
         if coingecko_id and coin_details:
             historical_data_list_full = fetch_historical_data_sqlite(coingecko_id, days=MAX_HISTORICAL_DAYS)
@@ -680,11 +613,11 @@ with col2:
                 
                 forecaster = CryptoDataForecaster(st.session_state.current_symbol, df_historical_full)
                 
-                with st.spinner(f"მიმდინარეობს {st.session_state.prediction_model} პროგნოზირება..."):
-                    prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS, model_choice=st.session_state.prediction_model)
+                with st.spinner(f"მიმდინარეობს LSTM მოდელით პროგნოზირება..."):
+                    prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS)
                 
                 if not prediction_data_list:
-                    st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა {st.session_state.prediction_model} მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
+                    st.warning(f"პროგნოზის გენერირება ვერ მოხერხდა LSTM Model მოდელით. გთხოვთ, სცადოთ სხვა მოდელი ან სხვა კრიპტოვალუტა.")
                 
                 df_prediction = pd.DataFrame(prediction_data_list)
                 if not df_prediction.empty:
@@ -692,10 +625,11 @@ with col2:
                 
                 signals = forecaster.generate_signals_from_prediction(prediction_data_list)
                 
-                df_indicators_display = forecaster.historical_with_indicators.tail(st.session_state.current_period).copy()
+                # We always use MAX_HISTORICAL_DAYS now
+                df_indicators_display = forecaster.historical_with_indicators.tail(MAX_HISTORICAL_DAYS).copy()
 
                 # Calculate Support & Resistance
-                support_level, resistance_level = calculate_support_resistance(df_historical_full.tail(st.session_state.current_period))
+                support_level, resistance_level = calculate_support_resistance(df_historical_full.tail(MAX_HISTORICAL_DAYS))
 
                 # --- Create Plotly Subplots ---
                 fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
@@ -892,8 +826,8 @@ with col3:
             
             forecaster = CryptoDataForecaster(st.session_state.current_symbol, pd.DataFrame(historical_data_list_full))
             
-            with st.spinner(f"გენერირდება სიგნალები {st.session_state.prediction_model} მოდელიდან..."):
-                prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS, model_choice=st.session_state.prediction_model)
+            with st.spinner(f"გენერირდება სიგნალები LSTM მოდელიდან..."):
+                prediction_data_list = forecaster.generate_predictions(days=PREDICTION_DAYS)
             signals = forecaster.generate_signals_from_prediction(prediction_data_list)
             
             if signals:
