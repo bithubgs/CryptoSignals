@@ -622,7 +622,7 @@ if 'last_update' not in st.session_state:
     st.session_state.last_update = None
 
 # Popular cryptocurrencies with more options
-popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOGE', 'MATIC', 'DOT']
+popular_cryptos = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'SAND', 'SKL', 'RVN']
 
 # Main layout
 col1, col2, col3 = st.columns([3, 6, 3])
